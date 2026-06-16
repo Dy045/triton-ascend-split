@@ -67,18 +67,6 @@ static bool isStaticConstAbsGtOne(Value v) {
     return false;
 }
 
-static bool isStaticConst(Value v) {
-    IntegerAttr scalarAttr;
-    if (matchPattern(v, m_Constant(&scalarAttr))) return true;
-    DenseElementsAttr denseAttr;
-    if (matchPattern(v, m_Constant(&denseAttr)) && denseAttr.isSplat() &&
-        denseAttr.getElementType().isInteger())
-        return true;
-    if (auto splatOp = v.getDefiningOp<triton::SplatOp>())
-        return isStaticConst(splatOp.getSrc());
-    return false;
-}
-
 static std::optional<int64_t> getStaticConstInt(Value v) {
     IntegerAttr scalarAttr;
     if (matchPattern(v, m_Constant(&scalarAttr)))
@@ -126,21 +114,9 @@ static bool shouldRouteMaskedSingleTilePow2ToIndirect(
     return upperBound && *upperBound <= blockSize;
 }
 
-// Lightweight pre-check: walks the offset's defining-op tree (bounded depth,
-// staying within tensor-typed values) looking for any arith.muli whose result
-// is a tensor and either one operand is a static constant with |c| > 1, or the
-// multiply uses a dynamic scale. Returns false if no such per-element
-// multiplication exists, in which case the per-element stride must be 1 and we
-// should NOT invoke the heavier PtrAnalysis (which mutates IR via the rewriter;
-// calling it before we commit to rewriting would violate MLIR's pattern contract
-// -- the greedy driver would treat our return-failure() as a real change and
-// loop until max iterations, failing the PassManager).
-//
-// Crucially, we do NOT recurse through scalar values: scalar arithmetic
-// (e.g. `xoffset = pid * BLOCK_SIZE`) does not affect per-element stride;
-// only tensor-level multiplications do. Without this restriction, kernels
-// that compute a scalar block offset by multiplying by the block size would
-// be incorrectly flagged as "possibly stride>1".
+// Cheaply detect tensor-level static stride > 1 before running PtrAnalysis,
+// which mutates IR. Dynamic stride stays on the structured SIMD path, and
+// scalar offset arithmetic does not affect per-element stride.
 static bool offsetMayContainStrideGtOne(Value offset, int depthBudget = 16) {
     if (depthBudget <= 0) {
         return true;  // Give up cheaply and let PtrAnalysis decide downstream.
@@ -157,8 +133,6 @@ static bool offsetMayContainStrideGtOne(Value offset, int depthBudget = 16) {
             isStaticConstAbsGtOne(mul.getRhs())) {
             return true;
         }
-        if (!isStaticConst(mul.getLhs()) && !isStaticConst(mul.getRhs()))
-            return true;
         return offsetMayContainStrideGtOne(mul.getLhs(), depthBudget - 1) ||
                offsetMayContainStrideGtOne(mul.getRhs(), depthBudget - 1);
     }
@@ -176,7 +150,6 @@ static bool offsetMayContainStrideGtOne(Value offset, int depthBudget = 16) {
             denseAttr.getSplatValue<llvm::APInt>().getSExtValue() >= 1) {
             return true;
         }
-        if (!isStaticConst(shl.getRhs())) return true;
         return offsetMayContainStrideGtOne(shl.getLhs(), depthBudget - 1);
     }
     for (Value operand : defOp->getOperands()) {
@@ -406,23 +379,19 @@ static LogicalResult tryRewriteAddPtrLoad(triton::LoadOp op,
     ptrState.analyzePermute();
     if (ptrState.isPermuted) return markInspectedAndReturn();
 
-    // Stride dispatch (mirrors tryRewriteBlockPtrLoad): DECLINE for most static
-    // power-of-two strides (-> strided DMA / deinterleave); non-power-of-two
-    // static, dynamic, and masked single-tile pow2 strides fall through to SIMT
-    // indirect.
+    // Use SIMT indirect only for static non-pow2 or masked single-tile pow2
+    // strides; keep dynamic strides on the structured SIMD path.
     auto lastStrideOpt = getConstantIntValue(ptrState.stateInfo.back().stride);
-    int64_t lastStride = -1;  // -1 == dynamic
-    if (lastStrideOpt.has_value()) {
-        lastStride = std::abs(lastStrideOpt.value());
-        if (lastStride <= 1) return markInspectedAndReturn();
-        bool routeMaskedPow2ToIndirect =
-            shouldRouteMaskedSingleTilePow2ToIndirect(op.getMask(), resultType);
-        if (lastStride == 2 && !routeMaskedPow2ToIndirect)
-            return markInspectedAndReturn();  // even -> deinterleave; odd -> strided DMA
-        if ((lastStride & (lastStride - 1)) == 0 &&
-            !routeMaskedPow2ToIndirect)
-            return markInspectedAndReturn();  // power-of-two >= 4 -> strided DMA
-    }
+    if (!lastStrideOpt.has_value()) return markInspectedAndReturn();
+    int64_t lastStride = std::abs(lastStrideOpt.value());
+    if (lastStride <= 1) return markInspectedAndReturn();
+    bool routeMaskedPow2ToIndirect =
+        shouldRouteMaskedSingleTilePow2ToIndirect(op.getMask(), resultType);
+    if (lastStride == 2 && !routeMaskedPow2ToIndirect)
+        return markInspectedAndReturn();  // even -> deinterleave; odd -> strided DMA
+    if ((lastStride & (lastStride - 1)) == 0 &&
+        !routeMaskedPow2ToIndirect)
+        return markInspectedAndReturn();  // power-of-two >= 4 -> strided DMA
 
     Value offsetTensor =
         ensureI64OffsetTensor(addPtrOp.getOffset(), loc, rewriter);
@@ -484,23 +453,19 @@ static LogicalResult tryRewriteBlockPtrLoad(triton::LoadOp op,
     if (strides.empty() || static_cast<int64_t>(strides.size()) != rank)
         return failure();
     // Stride dispatch: strided DMA on the MTE engine only supports power-of-two
-    // strides; a non-power-of-two stride would degrade to a slow scalar access,
-    // and a dynamic stride cannot be proven to be a power of two -- both are
-    // better served by the SIMT indirect gather. So we only DECLINE the indirect
-    // rewrite (-> strided DMA / deinterleave) for *static power-of-two* strides:
+    // strides; a non-power-of-two stride would degrade to a slow scalar access.
+    // Dynamic strides stay on the structured SIMD path because they may be
+    // runtime stride 1 or power-of-two, where SIMT indirect is slower. So we
+    // only rewrite to SIMT indirect for *static non-power-of-two* strides:
     //   stride 1 -> contiguous; stride 2 (even dim) -> deinterleave;
     //   stride >= 4 (power of two) -> (compact) strided DMA.
-    // Everything else (non-power-of-two static, or dynamic) falls through to the
-    // SIMT indirect gather below (the offset tensor is built from the stride
-    // Values, so a dynamic stride is fine).
     APInt lastStrideC;
-    int64_t lastStride = -1;  // -1 == dynamic (not a static constant)
-    if (matchPattern(strides.back(), m_ConstantInt(&lastStrideC))) {
-        lastStride = std::abs(lastStrideC.getSExtValue());
-        if (lastStride <= 1) return failure();
-        if (lastStride == 2) return failure();  // even -> deinterleave; odd -> strided DMA
-        if ((lastStride & (lastStride - 1)) == 0) return failure();  // power-of-two >= 4 -> strided DMA
-    }
+    if (!matchPattern(strides.back(), m_ConstantInt(&lastStrideC)))
+        return failure();
+    int64_t lastStride = std::abs(lastStrideC.getSExtValue());
+    if (lastStride <= 1) return failure();
+    if (lastStride == 2) return failure();  // even -> deinterleave; odd -> strided DMA
+    if ((lastStride & (lastStride - 1)) == 0) return failure();  // power-of-two >= 4 -> strided DMA
 
     // ---- Compute per-axis effective base offsets: mtpt.offsets[d] + (advance.offsets[d] if present)
     ValueRange mtptOffsets = mtpt.getOffsets();
@@ -648,23 +613,19 @@ static LogicalResult tryRewriteAddPtrStore(triton::StoreOp op,
     ptrState.analyzePermute();
     if (ptrState.isPermuted) return markInspectedAndReturn();
 
-    // Stride dispatch (mirrors tryRewriteBlockPtrLoad): DECLINE for most static
-    // power-of-two strides (-> strided DMA / deinterleave); non-power-of-two
-    // static, dynamic, and masked single-tile pow2 strides fall through to SIMT
-    // indirect.
+    // Use SIMT indirect only for static non-pow2 or masked single-tile pow2
+    // strides; keep dynamic strides on the structured SIMD path.
     auto lastStrideOpt = getConstantIntValue(ptrState.stateInfo.back().stride);
-    int64_t lastStride = -1;  // -1 == dynamic
-    if (lastStrideOpt.has_value()) {
-        lastStride = std::abs(lastStrideOpt.value());
-        if (lastStride <= 1) return markInspectedAndReturn();
-        bool routeMaskedPow2ToIndirect =
-            shouldRouteMaskedSingleTilePow2ToIndirect(op.getMask(), valueType);
-        if (lastStride == 2 && !routeMaskedPow2ToIndirect)
-            return markInspectedAndReturn();  // even -> deinterleave; odd -> strided DMA
-        if ((lastStride & (lastStride - 1)) == 0 &&
-            !routeMaskedPow2ToIndirect)
-            return markInspectedAndReturn();  // power-of-two >= 4 -> strided DMA
-    }
+    if (!lastStrideOpt.has_value()) return markInspectedAndReturn();
+    int64_t lastStride = std::abs(lastStrideOpt.value());
+    if (lastStride <= 1) return markInspectedAndReturn();
+    bool routeMaskedPow2ToIndirect =
+        shouldRouteMaskedSingleTilePow2ToIndirect(op.getMask(), valueType);
+    if (lastStride == 2 && !routeMaskedPow2ToIndirect)
+        return markInspectedAndReturn();  // even -> deinterleave; odd -> strided DMA
+    if ((lastStride & (lastStride - 1)) == 0 &&
+        !routeMaskedPow2ToIndirect)
+        return markInspectedAndReturn();  // power-of-two >= 4 -> strided DMA
 
     Value offsetTensor =
         ensureI64OffsetTensor(addPtrOp.getOffset(), loc, rewriter);
@@ -715,17 +676,16 @@ static LogicalResult tryRewriteBlockPtrStore(triton::StoreOp op,
     auto strides = mtpt.getStrides();
     if (strides.empty() || static_cast<int64_t>(strides.size()) != rank)
         return failure();
-    // Stride dispatch (mirrors tryRewriteBlockPtrLoad): only DECLINE the indirect
-    // rewrite for static power-of-two strides (-> strided DMA / deinterleave);
-    // non-power-of-two static and dynamic strides fall through to SIMT indirect.
+    // Stride dispatch (mirrors tryRewriteBlockPtrLoad): dynamic strides stay on
+    // the structured SIMD path; only static non-power-of-two strides fall
+    // through to SIMT indirect.
     APInt lastStrideC;
-    int64_t lastStride = -1;  // -1 == dynamic
-    if (matchPattern(strides.back(), m_ConstantInt(&lastStrideC))) {
-        lastStride = std::abs(lastStrideC.getSExtValue());
-        if (lastStride <= 1) return failure();
-        if (lastStride == 2) return failure();  // even -> deinterleave; odd -> strided DMA
-        if ((lastStride & (lastStride - 1)) == 0) return failure();  // power-of-two >= 4 -> strided DMA
-    }
+    if (!matchPattern(strides.back(), m_ConstantInt(&lastStrideC)))
+        return failure();
+    int64_t lastStride = std::abs(lastStrideC.getSExtValue());
+    if (lastStride <= 1) return failure();
+    if (lastStride == 2) return failure();  // even -> deinterleave; odd -> strided DMA
+    if ((lastStride & (lastStride - 1)) == 0) return failure();  // power-of-two >= 4 -> strided DMA
 
     ValueRange mtptOffsets = mtpt.getOffsets();
     ValueRange advOffsets = advance ? advance.getOffsets() : ValueRange{};

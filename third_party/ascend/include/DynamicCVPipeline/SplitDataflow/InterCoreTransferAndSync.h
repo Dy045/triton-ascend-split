@@ -146,7 +146,7 @@ private:
   void insertInterCoreSync(mlir::OpBuilder &builder, mlir::Operation *transferOp, mlir::Operation *consumerStartOp,
     mlir::Operation *consumerEndOp, int flag, mlir::Location loc, int transferIndex, FlagIdReuseManager &flagIdReuseManager,
     mlir::Operation *consumedDataOp = nullptr);
-  void insertPipeSSync(mlir::OpBuilder &builder, mlir::Operation *producerOp, mlir::Operation *consumerOp, int flag,
+  void insertMemDepSync(mlir::OpBuilder &builder, mlir::Operation *producerOp, mlir::Operation *consumerOp, int flag,
     mlir::Location loc, bool isCubeToVector);
   llvm::SmallVector<mlir::Operation *> insertAnalyzeFlagRelations(mlir::ModuleOp module, FlagIdReuseManager &flagIdReuseManager);
   void remapInterCoreTransferFlagIds(llvm::DenseMap<int, int> &remapResult);

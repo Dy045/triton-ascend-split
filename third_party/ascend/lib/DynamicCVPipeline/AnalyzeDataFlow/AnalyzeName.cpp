@@ -57,6 +57,8 @@ static constexpr llvm::StringLiteral interceptrFunc[] {
   "parallel_rebased_fwd_kernel",
   "parallel_path_bwd_dkv_kernel",
   "parallel_path_bwd_dq_kernel",
+  "parallel_nsa_compression_fwd_kernel",
+  "parallel_nsa_compression_bwd_kernel_dq",
   "chunkwise_bwd_kernel_hdqgl",
   "chunk_mesa_net_fwd_kernel_h",
   "parallel_simple_gla_bwd_kernel",
