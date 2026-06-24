@@ -57,7 +57,7 @@ LogicalResult topologicalSort(SmallVector<Operation *> &ops);
 SmallVector<int> getBlockIdsInOrder(scf::ForOp forOp);
 
 // Get the block_id of the immediate child of scf.for that contains op
-std::optional<int64_t> getForDirectChildBlockId(Operation *op);
+std::optional<int> getForDirectChildBlockId(Operation *op);
 
 // Find the tcb group id that contains value v
 int findTcbGroupId(

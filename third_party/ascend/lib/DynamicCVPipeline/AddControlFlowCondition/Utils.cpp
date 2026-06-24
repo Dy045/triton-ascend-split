@@ -170,7 +170,7 @@ SmallVector<int> triton::getBlockIdsInOrder(scf::ForOp forOp) {
 // For nested ops inside scf.if/scf.for, returns the block_id of the immediate
 // child of scf.for Only considers scf.for ops that have ssbuffer.main_loop
 // attribute
-std::optional<int64_t> triton::getForDirectChildBlockId(Operation *op) {
+std::optional<int> triton::getForDirectChildBlockId(Operation *op) {
   if (!op) {
     return std::nullopt;
   }
