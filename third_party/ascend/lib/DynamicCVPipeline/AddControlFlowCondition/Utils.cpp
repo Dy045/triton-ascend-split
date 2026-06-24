@@ -29,9 +29,8 @@ using namespace mlir;
 using namespace llvm;
 
 // Collect all nested ops within an operation's regions
-LogicalResult
-triton::collectAllNestedOps(Operation *op,
-                            llvm::DenseSet<Operation *> &regionOps) {
+LogicalResult triton::collectAllNestedOps(Operation *op, llvm::DenseSet<Operation *> &regionOps)
+{
   if (!op) {
     return failure();
   }
@@ -55,8 +54,9 @@ triton::collectAllNestedOps(Operation *op,
 }
 
 // Group operations by their block_id attribute
-LogicalResult triton::collectOpsByBlockId(
-    scf::ForOp forOp, llvm::DenseMap<int, SmallVector<Operation *>> &blockOps) {
+LogicalResult triton::collectOpsByBlockId(scf::ForOp forOp,
+                                          llvm::DenseMap<int, SmallVector<Operation *>> &blockOps)
+{
   for (Operation &op : forOp.getBody()->without_terminator()) {
     if (auto attr = op.getAttrOfType<IntegerAttr>(CVPipeline::kBlockId)) {
       blockOps[attr.getInt()].push_back(&op);
@@ -69,12 +69,13 @@ LogicalResult triton::collectOpsByBlockId(
 }
 
 // DFS for topological sort - returns failure if cycle detected
-static LogicalResult
-dfsTopologicalSort(Operation *op, llvm::DenseSet<Operation *> &visited,
-                   llvm::DenseSet<Operation *> &inStack,
-                   const llvm::DenseSet<Operation *> &ops,
-                   llvm::DenseMap<Operation *, int> *opOrder,
-                   SmallVectorImpl<Operation *> &sorted) {
+static LogicalResult dfsTopologicalSort(
+    Operation *op, llvm::DenseSet<Operation *> &visited,
+    llvm::DenseSet<Operation *> &inStack,
+    const llvm::DenseSet<Operation *> &ops,
+    llvm::DenseMap<Operation *, int> *opOrder,
+    SmallVectorImpl<Operation *> &sorted)
+{
   if (!op) {
     return success();
   }
@@ -98,14 +99,11 @@ dfsTopologicalSort(Operation *op, llvm::DenseSet<Operation *> &visited,
   }
 
   if (opOrder && !opOrder->empty()) {
-    llvm::sort(deps, [&](Operation *a, Operation *b) {
-      return (*opOrder)[a] < (*opOrder)[b];
-    });
+    llvm::sort(deps, [&](Operation *a, Operation *b) { return (*opOrder)[a] < (*opOrder)[b]; });
   }
 
   for (Operation *dep : deps) {
-    if (failed(
-            dfsTopologicalSort(dep, visited, inStack, ops, opOrder, sorted))) {
+    if (failed(dfsTopologicalSort(dep, visited, inStack, ops, opOrder, sorted))) {
       return failure();
     }
   }
@@ -118,27 +116,26 @@ dfsTopologicalSort(Operation *op, llvm::DenseSet<Operation *> &visited,
 // Topological sort of operations based on operand dependencies
 LogicalResult triton::topologicalSort(llvm::DenseSet<Operation *> &ops,
                                       llvm::DenseMap<Operation *, int> *opOrder,
-                                      SmallVectorImpl<Operation *> &sorted) {
+                                      SmallVectorImpl<Operation *> &sorted)
+{
   llvm::DenseSet<Operation *> visited;
   llvm::DenseSet<Operation *> inStack;
 
   SmallVector<Operation *> opList(ops.begin(), ops.end());
   if (opOrder && !opOrder->empty()) {
-    llvm::sort(opList, [&](Operation *a, Operation *b) {
-      return (*opOrder)[a] < (*opOrder)[b];
-    });
+    llvm::sort(opList, [&](Operation *a, Operation *b) { return (*opOrder)[a] < (*opOrder)[b]; });
   }
 
   for (Operation *op : opList) {
-    if (failed(
-            dfsTopologicalSort(op, visited, inStack, ops, opOrder, sorted))) {
+    if (failed(dfsTopologicalSort(op, visited, inStack, ops, opOrder, sorted))) {
       return failure();
     }
   }
   return success();
 }
 
-LogicalResult triton::topologicalSort(SmallVector<Operation *> &ops) {
+LogicalResult triton::topologicalSort(SmallVector<Operation *> &ops)
+{
   llvm::DenseSet<Operation *> opSet(ops.begin(), ops.end());
   SmallVector<Operation *> sorted;
 
@@ -150,13 +147,13 @@ LogicalResult triton::topologicalSort(SmallVector<Operation *> &ops) {
 }
 
 // Get block_ids in order of appearance in for loop body
-SmallVector<int> triton::getBlockIdsInOrder(scf::ForOp forOp) {
+SmallVector<int> triton::getBlockIdsInOrder(scf::ForOp forOp)
+{
   SmallVector<int> idsInOrder;
   llvm::DenseSet<int> seenIds;
 
   for (Operation &op : forOp.getBody()->without_terminator()) {
-    if (auto blockIdAttr =
-            op.getAttrOfType<IntegerAttr>(CVPipeline::kBlockId)) {
+    if (auto blockIdAttr = op.getAttrOfType<IntegerAttr>(CVPipeline::kBlockId)) {
       int id = blockIdAttr.getInt();
       if (seenIds.insert(id).second) {
         idsInOrder.push_back(id);
@@ -167,10 +164,9 @@ SmallVector<int> triton::getBlockIdsInOrder(scf::ForOp forOp) {
 }
 
 // Get the block_id of the immediate child of scf.for that contains op
-// For nested ops inside scf.if/scf.for, returns the block_id of the immediate
-// child of scf.for Only considers scf.for ops that have ssbuffer.main_loop
-// attribute
-std::optional<int64_t> triton::getForDirectChildBlockId(Operation *op) {
+// For nested ops inside scf.if/scf.for, returns the block_id of the immediate child of scf.for
+// Only considers scf.for ops that have ssbuffer.main_loop attribute
+std::optional<int> triton::getForDirectChildBlockId(Operation *op) {
   if (!op) {
     return std::nullopt;
   }
@@ -189,9 +185,8 @@ std::optional<int64_t> triton::getForDirectChildBlockId(Operation *op) {
 }
 
 // Find the tcb group id that contains value v
-int triton::findTcbGroupId(
-    Value v,
-    llvm::DenseMap<int, SmallVector<Value>> &tightlyCoupledBufferGroups) {
+int triton::findTcbGroupId(Value v, llvm::DenseMap<int, SmallVector<Value>> &tightlyCoupledBufferGroups)
+{
   for (auto &tcbEntry : tightlyCoupledBufferGroups) {
     if (llvm::is_contained(tcbEntry.second, v)) {
       return tcbEntry.first;
@@ -201,10 +196,9 @@ int triton::findTcbGroupId(
 }
 
 // Get isCube/isVector based on the scope's tcore_type attribute
-// Returns failure if scopeOp does not have tcore_type attribute or it's not
-// CUBE/VECTOR
-LogicalResult triton::getScopeType(Operation *scopeOp, bool &isCube,
-                                   bool &isVector) {
+// Returns failure if scopeOp does not have tcore_type attribute or it's not CUBE/VECTOR
+LogicalResult triton::getScopeType(Operation *scopeOp, bool &isCube, bool &isVector)
+{
   isCube = false;
   isVector = false;
 
@@ -213,10 +207,8 @@ LogicalResult triton::getScopeType(Operation *scopeOp, bool &isCube,
   }
 
   auto attr = scopeOp->getAttr(CVPipeline::kTcoreType);
-  auto aiCAttr =
-      hivm::TCoreTypeAttr::get(scopeOp->getContext(), hivm::TCoreType::CUBE);
-  auto aiVAttr =
-      hivm::TCoreTypeAttr::get(scopeOp->getContext(), hivm::TCoreType::VECTOR);
+  auto aiCAttr = hivm::TCoreTypeAttr::get(scopeOp->getContext(), hivm::TCoreType::CUBE);
+  auto aiVAttr = hivm::TCoreTypeAttr::get(scopeOp->getContext(), hivm::TCoreType::VECTOR);
   if (attr == aiCAttr) {
     isCube = true;
   } else if (attr == aiVAttr) {

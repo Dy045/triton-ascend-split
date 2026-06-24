@@ -54,7 +54,7 @@ llvm::LogicalResult verifyOpBlockId(Operation *op)
     return llvm::success();
 }
 
-std::optional<int64_t> getOpBlockId(Operation *op)
+std::optional<int> getOpBlockId(Operation *op)
 {
     if (!op) {
         return std::nullopt;
@@ -73,7 +73,7 @@ int getAvailableBlockId(ModuleOp module)
     module.walk([&](Operation *op) {
         auto blockIdOpt = getOpBlockId(op);
         if (blockIdOpt) {
-            int currentId = static_cast<int>(*blockIdOpt);
+            int currentId = *blockIdOpt;
             if (currentId > maxBlockId) {
                 maxBlockId = currentId;
             }

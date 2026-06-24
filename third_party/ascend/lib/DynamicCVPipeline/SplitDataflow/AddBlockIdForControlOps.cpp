@@ -22,19 +22,20 @@
  */
 
 #include "ascend/include/DynamicCVPipeline/SplitDataflow/AddBlockIdForControlOps.h"
+#include "ascend/include/DynamicCVPipeline/SplitDataflow/Utils.h"
 #include "ascend/include/DynamicCVPipeline/Common/Utils.h"
 #include "llvm/Support/Debug.h"
 
 using namespace mlir;
 
 static constexpr const char *DEBUG_TYPE = "add-block-id-for-control-ops";
-#define LOG_DEBUG(...)                                                         \
-  LLVM_DEBUG(llvm::dbgs() << " [" << DEBUG_TYPE << "] " << __VA_ARGS__)
+#define LOG_DEBUG(...) LLVM_DEBUG(llvm::dbgs() << " [" << DEBUG_TYPE << "] " << __VA_ARGS__)
 
 using namespace mlir::triton;
 
 // Pass Entry Point
-void AddBlockIdForControlOpsPass::runOnOperation() {
+void AddBlockIdForControlOpsPass::runOnOperation()
+{
   LOG_DEBUG("\n--- enter AddBlockIdForControlOpsPass --->\n");
   ModuleOp module = getOperation();
 
@@ -46,18 +47,30 @@ void AddBlockIdForControlOpsPass::runOnOperation() {
   // Step 2: add block_id for control flow ops
   module.walk([&](Operation *op) {
     // skip op with block_id
-    if (op->getAttrOfType<IntegerAttr>("ssbuffer.block_id")) {
+    if (op->getAttrOfType<IntegerAttr>(CVPipeline::kBlockId)) {
       return;
     }
 
-    if (isa<scf::ForOp, scf::IfOp, scf::WhileOp>(op)) {
+    if (isa<scf::ForOp, scf::IfOp>(op)) {
       maxBlockId++;
-      static constexpr int kIntegerBitWidth = 32;
-      op->setAttr("ssbuffer.block_id",
-                  IntegerAttr::get(
-                      IntegerType::get(module.getContext(), kIntegerBitWidth),
-                      maxBlockId));
+      setOpBlockId(op, maxBlockId);
       LOG_DEBUG("Added block_id " << maxBlockId << " to " << *op << "\n");
+    }
+
+    // coretype of scf.yield may not be the same with defining op
+    if (isa<scf::YieldOp>(op) && isa<scf::IfOp>(op->getParentOp())) {
+      Operation *parentOp = op->getParentOp();
+      auto ifBlockIdOpt = CVPipeline::getOpBlockId(parentOp);
+
+      int yieldBlockId;
+      if (ifBlockIdOpt) {
+        yieldBlockId = *ifBlockIdOpt;
+      } else {
+        maxBlockId++;
+        yieldBlockId = maxBlockId;
+      }
+      setOpBlockId(op, yieldBlockId);
+      LOG_DEBUG("Added block_id " << yieldBlockId << " to " << *op << "\n");
     }
   });
 
@@ -68,8 +81,9 @@ void AddBlockIdForControlOpsPass::runOnOperation() {
 namespace mlir {
 namespace triton {
 
-std::unique_ptr<OperationPass<ModuleOp>> createAddBlockIdForControlOpsPass() {
-  return std::make_unique<AddBlockIdForControlOpsPass>();
+std::unique_ptr<OperationPass<ModuleOp>> createAddBlockIdForControlOpsPass()
+{
+    return std::make_unique<AddBlockIdForControlOpsPass>();
 }
 
 } // namespace triton
