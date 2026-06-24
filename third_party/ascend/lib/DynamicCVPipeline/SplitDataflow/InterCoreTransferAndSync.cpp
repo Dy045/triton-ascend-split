@@ -336,6 +336,28 @@ void InterCoreTransferAndSyncPass::padMatmulInnerDim(OpBuilder &builder,
   attachCommonTags(tensorInsertSliceOp, matmulOpBlockId, "CUBE");
 }
 
+bool InterCoreTransferAndSyncPass::matmulCIsEmpty(mlir::Value acc)
+{
+    auto accDefOp = acc.getDefiningOp();
+    if (accDefOp) {
+        if (isa<tensor::EmptyOp>(accDefOp)) {
+            return true;
+        }
+        if (auto fillOp = dyn_cast<linalg::FillOp>(accDefOp)) {
+            Value fillVal = fillOp.getOperand(0); 
+            if (auto constOp = fillVal.getDefiningOp<arith::ConstantOp>()) {
+                Attribute attr = constOp.getValue();
+
+                if ((isa<FloatAttr>(attr) && cast<FloatAttr>(attr).getValue().isZero()) ||
+                    (isa<IntegerAttr>(attr) && cast<IntegerAttr>(attr).getValue().isZero())) {
+                    return true;
+                }
+            }
+        }
+    }
+    return false;
+}
+
 void InterCoreTransferAndSyncPass::extractMatmulResult(
     OpBuilder &builder, Operation *matmulOp, Location loc, int matmulOpBlockId,
     llvm::DenseMap<mlir::Value, mlir::Value> &cubeValueMapping,
@@ -348,6 +370,11 @@ void InterCoreTransferAndSyncPass::extractMatmulResult(
   auto rhsType = dyn_cast<RankedTensorType>(rhs.getType());
   auto accType = dyn_cast<RankedTensorType>(acc.getType());
   auto resType = dyn_cast<RankedTensorType>(originalResult.getType());
+  if (lhsType.getShape()[0] == accType.getShape()[0]
+      && rhsType.getShape()[1] == accType.getShape()[1]) {
+    return;
+  }
+
   ArrayRef<int64_t> accshape = accType.getShape();
   ArrayRef<int64_t> resshape = resType.getShape();
   SmallVector<int64_t> expectedShape = {lhsType.getShape()[0],
@@ -369,7 +396,13 @@ void InterCoreTransferAndSyncPass::extractMatmulResult(
   attachCommonTags(tensorEmptyOp, matmulOpBlockId, "CUBE");
   attachCommonTags(linalgFillOp, matmulOpBlockId, "CUBE");
 
-  Value newAccResult = linalgFillOp->getResult(0);
+  mlir::Operation *paddingAccOp = linalgFillOp;
+  if (!matmulCIsEmpty(acc)) {
+    LOG_DEBUG("nd2nz shape is unaligned and matmul C is not empty");
+    signalPassFailure();
+  }
+
+  Value newAccResult = paddingAccOp->getResult(0);
 
   static constexpr int accIndex = 2;
   matmulOp->setOperand(accIndex, newAccResult);
