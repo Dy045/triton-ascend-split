@@ -47,7 +47,8 @@ public:
 
 private:
   SmallVector<Operation *> matchSeed(Operation *dotOp,
-                                     CVPipeline::ComputeBlockIdManager &bm);
+                                     CVPipeline::ComputeBlockIdManager &bm,
+                                     const CVPipeline::MemoryDependenceGraph &memGraph);
   llvm::LogicalResult
   processBlockWithCubeBFS(Block *block,
                           const CVPipeline::MemoryDependenceGraph &memGraph,
