@@ -398,6 +398,18 @@ void OpClassifierPass::matchMaterializePattern(Operation *user) {
   cubeSeeds.push_back(user);
 }
 
+static bool allResultHasOneUser(Operation *op)
+{
+    bool ret = true;
+    for (Value result : op->getResults()) {
+        if (!result.hasOneUse()) {
+            ret = false;
+            break;
+        }
+    }
+    return ret;
+}
+
 // Pattern matching for CUBE operations
 int OpClassifierPass::patternMatchCUBE() {
   LOG_DEBUG("--- Step 1: pattern match --->\n");
@@ -439,10 +451,16 @@ int OpClassifierPass::patternMatchCUBE() {
 
     // ---- Downstream pattern matching ----
     for (Value result : op->getResults()) {
+            if (!result.hasOneUse()) {
+                continue;
+            }
       for (Operation *user : result.getUsers()) {
         // If user is scf.yield, follow the chain to find real users
         Operation *curUser = user;
         while (curUser) {
+                    if (!allResultHasOneUser(curUser)) {
+                        break;
+                    }
           if (auto yieldOp = dyn_cast<scf::YieldOp>(curUser)) {
             if (Operation *scfOp = yieldOp->getParentOp()) {
               // Find which operand index the previous result corresponds to in
