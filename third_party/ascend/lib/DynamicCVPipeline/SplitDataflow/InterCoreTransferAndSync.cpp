@@ -258,6 +258,15 @@ SmallVector<int64_t> InterCoreTransferAndSyncPass::computeExpectedShape(mlir::Va
     int64_t newN = blN * nRound;
     LOG_DEBUG("newM" << newM << "\n");
     LOG_DEBUG("newN" << newN << "\n");
+
+    if (isOnlyDepInMatmul) {
+        if ((isMatmulA && newN != N) || (isMatmulB && newM != M)) {
+            LOG_DEBUG("nd2nz shape is unaligned and matmul A/B is from cube");
+            CVPipeline::setFallbackAttr(module);
+            signalPassFailure();
+        }
+    }
+
     return { newM, newN }; // Return 2D shape
 }
 
