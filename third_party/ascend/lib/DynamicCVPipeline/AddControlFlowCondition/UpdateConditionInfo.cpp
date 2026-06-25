@@ -259,7 +259,7 @@ UpdateConditionInfoPass::extendCrossCoreBuffersWithEquivalentValues(
         }
         int tcbGroupId = findTcbGroupId(buffer, tightlyCoupledBufferGroups);
         if (tcbGroupId == -1) {
-          LDBG("Can not find tightly_coupled_buffer id" << "\n");
+          LDBG("Can not find tightly_coupled_buffer id of: " << buffer << "\n");
           return errorMap;
         }
         if (addEquivalentValues(buffer, tightlyCoupledBufferGroups[tcbGroupId],
