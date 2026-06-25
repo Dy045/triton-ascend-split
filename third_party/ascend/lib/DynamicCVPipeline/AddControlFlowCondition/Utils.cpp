@@ -99,7 +99,12 @@ dfsTopologicalSort(Operation *op, llvm::DenseSet<Operation *> &visited,
 
   if (opOrder && !opOrder->empty()) {
     llvm::sort(deps, [&](Operation *a, Operation *b) {
-      return (*opOrder)[a] < (*opOrder)[b];
+      auto itA = opOrder->find(a);
+      auto itB = opOrder->find(b);
+      if (itA == opOrder->end() || itB == opOrder->end()) {
+        return false;
+      }
+      return itA->second < itB->second;
     });
   }
 
