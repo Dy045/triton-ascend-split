@@ -99,7 +99,14 @@ static LogicalResult dfsTopologicalSort(
   }
 
   if (opOrder && !opOrder->empty()) {
-    llvm::sort(deps, [&](Operation *a, Operation *b) { return (*opOrder)[a] < (*opOrder)[b]; });
+    llvm::sort(deps, [&](Operation *a, Operation *b) {
+      auto itA = opOrder->find(a);
+      auto itB = opOrder->find(b);
+      if (itA == opOrder->end() || itB == opOrder->end()) {
+        return false;
+      }
+      return itA->second < itB->second;
+    });
   }
 
   for (Operation *dep : deps) {
