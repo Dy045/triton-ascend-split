@@ -38,7 +38,7 @@ namespace triton {
 // main_loop
 struct TensorIterArgIfOpRelation {
   Value iterArg;
-  llvm::SmallVector<scf::IfOp> producers;
+  scf::IfOp producer;
   llvm::SmallVector<scf::IfOp> consumers;
 };
 

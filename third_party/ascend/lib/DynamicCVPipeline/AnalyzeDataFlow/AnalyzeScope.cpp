@@ -157,6 +157,12 @@ static LogicalResult verifyMainLoop(ModuleOp module) {
     return failure();
   };
 
+  if (isMainLoopOnlyCopyOrFixpipe(module)) {
+    LDBG("[INFO]: All main_loop only contains hivm.hir.copy or hivm.hir.fixpipe ops.");
+    CVPipeline::setFallbackAttr(module);
+    return failure();
+  }
+
   return success();
 }
 
