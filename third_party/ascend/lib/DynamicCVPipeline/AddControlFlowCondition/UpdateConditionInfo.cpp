@@ -94,7 +94,8 @@ UpdateConditionInfoPass::allocSSBuffer(ModuleOp module) {
   SmallVector<SmallVector<Value>> ssbufferPtrs;
   SmallVector<Value> ssbufferVec0Ptrs;
   SmallVector<Value> ssbufferVec1Ptrs;
-  int numBuffers = info->crossCoreDependentMap.size();
+  int numBuffers = info->crossCoreDependentMap.size() +
+                   info->memCrossCoreDependentMap.size();
   if (numBuffers == 0) {
     LDBG("crossCoreDependentMap is empty!" << "\n");
     return ssbufferPtrs;
@@ -144,11 +145,22 @@ UpdateConditionInfoPass::allocSSBuffer(ModuleOp module) {
 void UpdateConditionInfoPass::collectDependencyBuffers(
     scf::ForOp forOp,
     DenseMap<int, DenseMap<Value, SmallVector<Value>>> &crossCoreBuffers,
+    DenseMap<int, DenseMap<Operation *, SmallVector<Operation *>>>
+        &memCrossCoreBuffers,
     DenseMap<int, DenseMap<Value, SmallVector<Value>>> &intraCoreBuffers) {
   int crossCoreIdx = 0;
   for (auto &entry : info->crossCoreDependentMap) {
     crossCoreBuffers[crossCoreIdx][entry.first] = entry.second;
     crossCoreIdx++;
+  }
+
+  // Collect memCrossCoreDependentMap with offset groupIdx
+  int memCrossCoreOffset = info->crossCoreDependentMap.size();
+  int memCrossCoreIdx = 0;
+  for (auto &entry : info->memCrossCoreDependentMap) {
+    int adjustedGroupIdx = memCrossCoreOffset + memCrossCoreIdx;
+    memCrossCoreBuffers[adjustedGroupIdx][entry.first] = entry.second;
+    memCrossCoreIdx++;
   }
 
   if (info->intraCoreDependentMap.count(forOp)) {
@@ -332,6 +344,24 @@ static int buildBufferDependencyMappings(
   return UPDATE_CONDITION_INFO_SUCCESS;
 }
 
+// Helper function to build buffer dependency mappings for Operation* type
+// (memCrossCore)
+static int buildBufferDependencyMappingsForOps(
+    DenseMap<int, DenseMap<Operation *, SmallVector<Operation *>>> &buffers,
+    DenseMap<Operation *, int> &consumerToGroup,
+    DenseMap<Operation *, int> &producerToGroup) {
+  for (auto &[groupIdx, deps] : buffers) {
+    for (auto &[consumer, producers] : deps) {
+      consumerToGroup[consumer] = groupIdx;
+
+      for (Operation *producer : producers) {
+        producerToGroup[producer] = groupIdx;
+      }
+    }
+  }
+  return UPDATE_CONDITION_INFO_SUCCESS;
+}
+
 // getInputOutputValues - Analyze the input/output buffer groups used in a
 // single ifOp This function traverses all operations within ifOp, identifies
 // FixpipeOp, CopyOp and MaterializeInDestinationOp, and extracts cross-core and
@@ -356,6 +386,8 @@ static int buildBufferDependencyMappings(
 int UpdateConditionInfoPass::getInputOutputValues(
     scf::IfOp ifOp,
     DenseMap<int, DenseMap<Value, SmallVector<Value>>> crossCoreBuffers,
+    DenseMap<int, DenseMap<Operation *, SmallVector<Operation *>>>
+        memCrossCoreBuffers,
     DenseMap<int, DenseMap<Value, SmallVector<Value>>> intraCoreBuffers,
     SmallVector<int> &crossCoreInputValues,
     SmallVector<int> &crossCoreOutputValues,
@@ -376,10 +408,21 @@ int UpdateConditionInfoPass::getInputOutputValues(
   DenseMap<Operation *, int> crossCoreConsumerToGroup;
   DenseMap<Operation *, int> intraCoreConsumerToGroup;
 
+  // Build memCrossCore mappings (Operation* based)
+  DenseMap<Operation *, int> memCrossCoreConsumerToGroup;
+  DenseMap<Operation *, int> memCrossCoreProducerToGroup;
+
   // Build cross-core mappings
   if (buildBufferDependencyMappings(crossCoreBuffers, crossCoreConsumerToGroup,
                                     crossCoreOutputToGroups) ==
       UPDATE_CONDITION_INFO_FAILED) {
+    return UPDATE_CONDITION_INFO_FAILED;
+  }
+
+  // Build memCrossCore mappings
+  if (buildBufferDependencyMappingsForOps(
+          memCrossCoreBuffers, memCrossCoreConsumerToGroup,
+          memCrossCoreProducerToGroup) == UPDATE_CONDITION_INFO_FAILED) {
     return UPDATE_CONDITION_INFO_FAILED;
   }
 
@@ -399,8 +442,19 @@ int UpdateConditionInfoPass::getInputOutputValues(
     if (crossCoreConsumerToGroup.count(op)) {
       crossCoreInputSet.insert(crossCoreConsumerToGroup[op]);
     }
+    // Check if this op is a memCrossCore consumer (merge into
+    // crossCoreInputSet)
+    if (memCrossCoreConsumerToGroup.count(op)) {
+      crossCoreInputSet.insert(memCrossCoreConsumerToGroup[op]);
+    }
     if (intraCoreConsumerToGroup.count(op)) {
       intraCoreInputSet.insert(intraCoreConsumerToGroup[op]);
+    }
+
+    // Check if this op is a memCrossCore producer (merge into
+    // crossCoreOutputSet)
+    if (memCrossCoreProducerToGroup.count(op)) {
+      crossCoreOutputSet.insert(memCrossCoreProducerToGroup[op]);
     }
 
     bool isFixpipeOrCopy =
@@ -601,6 +655,8 @@ Value UpdateConditionInfoPass::addCrossCoreConditions(
     OpBuilder &builder, Location loc, SmallVector<int> crossCoreInputValues,
     SmallVector<int> crossCoreOutputValues,
     DenseMap<int, DenseMap<Value, SmallVector<Value>>> &crossCoreBuffers,
+    DenseMap<int, DenseMap<Operation *, SmallVector<Operation *>>>
+        &memCrossCoreBuffers,
     bool isAIC, Value zeroConst, DenseMap<int, Value> &VectorSSBufferPtrs,
     SmallVector<SmallVector<Value>> ssbufferPtrs) {
   Value conditions = nullptr;
@@ -645,8 +701,20 @@ Value UpdateConditionInfoPass::addCrossCoreConditions(
 
   for (int outputGroupIdx : crossCoreOutputValues) {
     int outputCount = 0;
-    for (auto &entry : crossCoreBuffers[outputGroupIdx]) {
-      outputCount += entry.second.size();
+    // Check if outputGroupIdx belongs to crossCoreBuffers or
+    // memCrossCoreBuffers
+    if (crossCoreBuffers.count(outputGroupIdx)) {
+      for (auto &entry : crossCoreBuffers[outputGroupIdx]) {
+        outputCount += entry.second.size();
+      }
+    } else if (memCrossCoreBuffers.count(outputGroupIdx)) {
+      for (auto &entry : memCrossCoreBuffers[outputGroupIdx]) {
+        outputCount += entry.second.size();
+      }
+    } else {
+      LDBG("outputGroupIdx " << outputGroupIdx
+                             << " not found in any buffers map!" << "\n");
+      return nullptr;
     }
     Value bufferNum =
         builder.create<arith::ConstantIntOp>(loc, outputCount, CONST_INT_TYPE);
@@ -781,6 +849,8 @@ int UpdateConditionInfoPass::setCrossCoreCondition(
     SmallVector<int> crossCoreInputValues,
     SmallVector<int> crossCoreOutputValues,
     DenseMap<int, DenseMap<Value, SmallVector<Value>>> &crossCoreBuffers,
+    DenseMap<int, DenseMap<Operation *, SmallVector<Operation *>>>
+        &memCrossCoreBuffers,
     scf::IfOp ifOp, SmallVector<SmallVector<Value>> ssbufferPtrs,
     Value &crossCoreCond) {
   OpBuilder builder(ifOp);
@@ -840,7 +910,8 @@ int UpdateConditionInfoPass::setCrossCoreCondition(
   // ========== Part 2: Add cross-core conditions ==========
   crossCoreCond = addCrossCoreConditions(
       builder, loc, crossCoreInputValues, crossCoreOutputValues,
-      crossCoreBuffers, isAIC, zeroConst, VectorSSBufferPtrs, ssbufferPtrs);
+      crossCoreBuffers, memCrossCoreBuffers, isAIC, zeroConst,
+      VectorSSBufferPtrs, ssbufferPtrs);
 
   // ========== Part 3: Update control variables ==========
   updateCrossCoreControlVars(builder, loc, ifOp, crossCoreInputValues,
@@ -935,6 +1006,9 @@ int UpdateConditionInfoPass::collectIntraCoreOutputConditions(
 
 // Build the ifOp variable mapping for the tensor iter_args
 int UpdateConditionInfoPass::buildTensorIterArgIfOpVarMap(scf::ForOp forOp) {
+  // Clear any previous data
+  tensorIterArgIfOpVars.clear();
+
   if (!info->tensorIterArgDepsMap.count(forOp) ||
       !info->tensorIterArgIndicesMap.count(forOp)) {
     LDBG("Skip buildTensorIterArgIfOpVarMap: no tensor iter_args info for this "
@@ -972,10 +1046,10 @@ int UpdateConditionInfoPass::buildTensorIterArgIfOpVarMap(scf::ForOp forOp) {
       consumerToVar[consumer] = var;
     }
 
-    // Add all the variables of the consumers that depend on each producer
-    for (scf::IfOp producer : relation.producers) {
+    // Add all the variables of the consumers that depend on the producer
+    if (relation.producer) {
       for (auto &[consumer, var] : consumerToVar) {
-        producerVars[producer].insert(var);
+        producerVars[relation.producer].insert(var);
       }
     }
 
@@ -987,14 +1061,14 @@ int UpdateConditionInfoPass::buildTensorIterArgIfOpVarMap(scf::ForOp forOp) {
 
   // Convert the temporary data structure to tensorIfOpVarMap
   for (auto &[producer, vars] : producerVars) {
-    auto &ifOpVars = info->tensorIterArgIfOpVars[producer];
+    auto &ifOpVars = tensorIterArgIfOpVars[producer];
     for (Value var : vars) {
       ifOpVars.producerVars.push_back(var);
     }
   }
 
   for (auto &[consumer, vars] : consumerVars) {
-    auto &ifOpVars = info->tensorIterArgIfOpVars[consumer];
+    auto &ifOpVars = tensorIterArgIfOpVars[consumer];
     for (Value var : vars) {
       ifOpVars.consumerVars.push_back(var);
     }
@@ -1007,11 +1081,11 @@ void UpdateConditionInfoPass::collectTensorIterArgInputConditions(
     OpBuilder &builder, Location loc, scf::IfOp ifOp,
     SmallVector<Value> &conditions, DenseSet<Value> &usedVarsSet,
     DenseMap<Value, VarUpdateType> &varUpdateTypes) {
-  if (!info->tensorIterArgIfOpVars.count(ifOp)) {
+  if (!tensorIterArgIfOpVars.count(ifOp)) {
     return;
   }
 
-  auto &ifOpVars = info->tensorIterArgIfOpVars[ifOp];
+  auto &ifOpVars = tensorIterArgIfOpVars[ifOp];
   for (Value var : ifOpVars.consumerVars) {
     Value varToUse = var;
     auto latestIt = controlVarToLatestValue.find(var);
@@ -1035,11 +1109,11 @@ void UpdateConditionInfoPass::collectTensorIterArgOutputConditions(
     OpBuilder &builder, Location loc, scf::IfOp ifOp,
     SmallVector<Value> &conditions, DenseSet<Value> &usedVarsSet,
     DenseMap<Value, VarUpdateType> &varUpdateTypes) {
-  if (!info->tensorIterArgIfOpVars.count(ifOp)) {
+  if (!tensorIterArgIfOpVars.count(ifOp)) {
     return;
   }
 
-  auto &ifOpVars = info->tensorIterArgIfOpVars[ifOp];
+  auto &ifOpVars = tensorIterArgIfOpVars[ifOp];
   for (Value var : ifOpVars.producerVars) {
     Value varToUse = var;
     auto latestIt = controlVarToLatestValue.find(var);
@@ -1490,11 +1564,29 @@ int UpdateConditionInfoPass::combineConditions(
     info->cntArgs[newIfOp] = counter;
   }
 
+  // Update mappings that refer to the old ifOp BEFORE erasing it
   // Update the tensorIterArgIfOpVars mapping
-  if (info->tensorIterArgIfOpVars.count(ifOp)) {
-    auto ifOpVars = info->tensorIterArgIfOpVars[ifOp];
-    info->tensorIterArgIfOpVars.erase(ifOp);
-    info->tensorIterArgIfOpVars[newIfOp] = ifOpVars;
+  if (tensorIterArgIfOpVars.count(ifOp)) {
+    auto ifOpVars = tensorIterArgIfOpVars[ifOp];
+    tensorIterArgIfOpVars.erase(ifOp);
+    tensorIterArgIfOpVars[newIfOp] = ifOpVars;
+  }
+
+  // Update tensorIterArgDepsMap with new ifOp
+  if (info->tensorIterArgDepsMap.count(forOp)) {
+    auto &depsVec = info->tensorIterArgDepsMap[forOp];
+    for (auto &relation : depsVec) {
+      // Update producer ifOp - use pointer comparison
+      if (relation.producer.getOperation() == ifOp.getOperation()) {
+        relation.producer = newIfOp;
+      }
+      // Update consumer ifOps
+      for (auto &consumerIfOp : relation.consumers) {
+        if (consumerIfOp.getOperation() == ifOp.getOperation()) {
+          consumerIfOp = newIfOp;
+        }
+      }
+    }
   }
 
   updateControlVarToLatestValue(newIfOp, ifOp, hasCounter, counter);
@@ -1533,11 +1625,17 @@ int UpdateConditionInfoPass::updateIfConds(
     }
 
     DenseMap<int, DenseMap<Value, SmallVector<Value>>> crossCoreBuffers;
+    DenseMap<int, DenseMap<Operation *, SmallVector<Operation *>>>
+        memCrossCoreBuffers;
     DenseMap<int, DenseMap<Value, SmallVector<Value>>> intraCoreBuffers;
     // Step1:Collect the dependency buffer info of this forOp
-    collectDependencyBuffers(forOp, crossCoreBuffers, intraCoreBuffers);
-    if (crossCoreBuffers.empty() && intraCoreBuffers.empty()) {
-      LDBG("crossCoreBuffers and intraCoreBuffers are both empty!" << "\n");
+    collectDependencyBuffers(forOp, crossCoreBuffers, memCrossCoreBuffers,
+                             intraCoreBuffers);
+    if (crossCoreBuffers.empty() && memCrossCoreBuffers.empty() &&
+        intraCoreBuffers.empty()) {
+      LDBG("crossCoreBuffers, memCrossCoreBuffers and intraCoreBuffers are all "
+           "empty!"
+           << "\n");
       return UPDATE_CONDITION_INFO_FAILED;
     }
 
@@ -1595,10 +1693,10 @@ int UpdateConditionInfoPass::updateIfConds(
       SmallVector<int> intraCoreInputValues;
       SmallVector<int> intraCoreOutputValues;
 
-      if (getInputOutputValues(ifOp, extendedCrossCoreBuffers, intraCoreBuffers,
-                               crossCoreInputValues, crossCoreOutputValues,
-                               intraCoreInputValues,
-                               intraCoreOutputValues) != 0) {
+      if (getInputOutputValues(
+              ifOp, extendedCrossCoreBuffers, memCrossCoreBuffers,
+              intraCoreBuffers, crossCoreInputValues, crossCoreOutputValues,
+              intraCoreInputValues, intraCoreOutputValues) != 0) {
         LDBG("getInputOutputValues failed!" << "\n");
         return UPDATE_CONDITION_INFO_FAILED;
       }
@@ -1606,8 +1704,8 @@ int UpdateConditionInfoPass::updateIfConds(
       // Step3:Set the crossCore condition
       Value crossCoreCond;
       if (setCrossCoreCondition(crossCoreInputValues, crossCoreOutputValues,
-                                crossCoreBuffers, ifOp, ssbufferPtrs,
-                                crossCoreCond) != 0) {
+                                crossCoreBuffers, memCrossCoreBuffers, ifOp,
+                                ssbufferPtrs, crossCoreCond) != 0) {
         LDBG("setCrossCoreCondition failed!" << "\n");
         return UPDATE_CONDITION_INFO_FAILED;
       }

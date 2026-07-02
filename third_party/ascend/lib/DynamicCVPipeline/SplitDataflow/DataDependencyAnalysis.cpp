@@ -234,7 +234,7 @@ void DataDependencyAnalysisPass::createBlockInfoMap(DataDependencyInfo &info) {
 void DataDependencyAnalysisPass::collectDepInfo(
     mlir::Value depvalue, DependencyType dependencyType,
     llvm::SmallVector<DependencyInfo> &dependencies, int iniProdId,
-    int iniConsId, DataDependencyInfo &info) {
+    int iniConsId, DataDependencyInfo &info, bool isAllTranspoesd) {
   DependencyInfo depInfo;
   depInfo.type = dependencyType;
   depInfo.value = depvalue;
@@ -254,6 +254,9 @@ void DataDependencyAnalysisPass::collectDepInfo(
   depInfo.consumerBlockId = commonLevelIds.second;
   if (isValidScalarDependency(depvalue)) {
     depInfo.isScaler = true;
+  }
+  if (isAllTranspoesd) {
+    depInfo.isAllTranspoesd = true;
   }
   dependencies.push_back(depInfo);
 }
@@ -515,6 +518,30 @@ void DataDependencyAnalysisPass::analyzeExternalOutputs(
 
       // Check who is using this output
       llvm::DenseSet<int> handledBlockIds;
+
+      // if c->v value will be transposed and then used by vector op, the value
+      // can be transposed within fixpipe
+      bool isAllTranspoesd = true;
+      for (mlir::Operation *user : output.getUsers()) {
+        if (!isa<linalg::TransposeOp>(user)) {
+          isAllTranspoesd = false;
+          continue;
+        }
+        for (mlir::Operation *transposeOpUser : user->getUsers()) {
+          if (getSsbufferCoreType(transposeOpUser) !=
+              ssbufferCoreTypeVectorAttr) {
+            isAllTranspoesd = false;
+            continue;
+          }
+        }
+      }
+      if (isAllTranspoesd) {
+        for (mlir::Operation *user : output.getUsers()) {
+          auto transposedValue = user->getResults()[0];
+          transposedValue.replaceAllUsesWith(opResult);
+        }
+      }
+
       for (mlir::Operation *user : output.getUsers()) {
         int outputIndex = 0;
         if (isControlFlowOp(user)) {
@@ -544,8 +571,8 @@ void DataDependencyAnalysisPass::analyzeExternalOutputs(
           auto inserted = handledBlockIds.insert(consumerId).second;
           if (inserted) {
             collectDepInfo(output, DependencyType::CubeToVector,
-                           c2vDependencies, blockInfo.blockId, consumerId,
-                           info);
+                           c2vDependencies, blockInfo.blockId, consumerId, info,
+                           isAllTranspoesd);
           }
         }
         // If user belongs to Cube block, this C->C dependency was handled
@@ -559,7 +586,8 @@ void DataDependencyAnalysisPass::analyzeExternalOutputs(
 void DataDependencyAnalysisPass::collectMemDepInfo(
     llvm::StringRef predCoreType, int producerBlockId, int consumerBlockId,
     int predBlockId, int currBlockId,
-    llvm::SmallVector<DependencyInfo> &memoryDependencies) {
+    llvm::SmallVector<DependencyInfo> &memoryDependencies,
+    mlir::Operation *predOp, mlir::Operation *nextOp) {
   DependencyInfo depInfo;
 
   if (predCoreType == ssbufferCoreTypeCubeAttr) {
@@ -571,6 +599,9 @@ void DataDependencyAnalysisPass::collectMemDepInfo(
   depInfo.consumerBlockId = consumerBlockId;
   depInfo.iniProducerBlockId = predBlockId;
   depInfo.iniConsumerBlockId = currBlockId;
+
+  depInfo.predOp = predOp;
+  depInfo.nextOp = nextOp;
 
   memoryDependencies.push_back(depInfo);
 }
@@ -624,7 +655,8 @@ void DataDependencyAnalysisPass::analyzeMemoryEffect(DataDependencyInfo &info) {
             return WalkResult::interrupt();
           }
           collectMemDepInfo(realPredCoreType, producerBlockId, consumerBlockId,
-                            realPredBlockId, currBlockId, memoryDependencies);
+                            realPredBlockId, currBlockId, memoryDependencies,
+                            realPredOp, op);
 
           LOG_DEBUG("\n=op with region mem dep analysis= "
                     << "\nrealpredcoretype" << realPredCoreType
@@ -654,7 +686,8 @@ void DataDependencyAnalysisPass::analyzeMemoryEffect(DataDependencyInfo &info) {
       }
 
       collectMemDepInfo(predCoreType, producerBlockId, consumerBlockId,
-                        predBlockId, currBlockId, memoryDependencies);
+                        predBlockId, currBlockId, memoryDependencies, predOp,
+                        op);
 
       LOG_DEBUG("\n=mem dep analysis= " << "\npredcoretype" << predCoreType
                                         << "\nproducer Block: " << predBlockId

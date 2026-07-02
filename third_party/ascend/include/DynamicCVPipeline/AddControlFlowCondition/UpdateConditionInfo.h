@@ -76,6 +76,8 @@ private:
   void collectDependencyBuffers(
       scf::ForOp forOp,
       DenseMap<int, DenseMap<Value, SmallVector<Value>>> &crossCoreBuffers,
+      DenseMap<int, DenseMap<Operation *, SmallVector<Operation *>>>
+          &memCrossCoreBuffers,
       DenseMap<int, DenseMap<Value, SmallVector<Value>>> &intraCoreBuffers);
 
   DenseMap<int, DenseMap<Value, SmallVector<Value>>>
@@ -91,6 +93,8 @@ private:
   int getInputOutputValues(
       scf::IfOp ifOp,
       DenseMap<int, DenseMap<Value, SmallVector<Value>>> crossCoreBuffers,
+      DenseMap<int, DenseMap<Operation *, SmallVector<Operation *>>>
+          memCrossCoreBuffers,
       DenseMap<int, DenseMap<Value, SmallVector<Value>>> intraCoreBuffers,
       SmallVector<int> &crossCoreInputValues,
       SmallVector<int> &crossCoreOutputValues,
@@ -173,6 +177,8 @@ private:
       SmallVector<int> crossCoreInputValues,
       SmallVector<int> crossCoreOutputValues,
       DenseMap<int, DenseMap<Value, SmallVector<Value>>> &crossCoreBuffers,
+      DenseMap<int, DenseMap<Operation *, SmallVector<Operation *>>>
+          &memCrossCoreBuffers,
       scf::IfOp ifOp, SmallVector<SmallVector<Value>> ssbufferPtrs,
       Value &crossCoreCond);
 
@@ -193,6 +199,8 @@ private:
       OpBuilder &builder, Location loc, SmallVector<int> crossCoreInputValues,
       SmallVector<int> crossCoreOutputValues,
       DenseMap<int, DenseMap<Value, SmallVector<Value>>> &crossCoreBuffers,
+      DenseMap<int, DenseMap<Operation *, SmallVector<Operation *>>>
+          &memCrossCoreBuffers,
       bool isAIC, Value zeroConst, DenseMap<int, Value> &precomputedPtrs,
       SmallVector<SmallVector<Value>> ssbufferPtrs);
 
@@ -208,6 +216,9 @@ private:
   DenseMap<Value, Value> controlVarToLatestValue;
   SmallVector<Value> currentUsedVars;
   ControlFlowConditionInfo *info = nullptr;
+  // Record each ifOp as the variables that need to be controlled when it acts
+  // as a consumer or a producer
+  llvm::DenseMap<scf::IfOp, TensorIterArgIfOpVars> tensorIterArgIfOpVars;
 };
 
 std::unique_ptr<OperationPass<ModuleOp>> createUpdateConditionInfoPass();
