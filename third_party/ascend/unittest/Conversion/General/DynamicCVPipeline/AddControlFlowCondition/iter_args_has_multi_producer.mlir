@@ -1,4 +1,4 @@
-// RUN: triton-opt --update-for-ops --debug %s 2>&1 | FileCheck %s
+// RUN: triton-opt --update-loop-ops --debug %s 2>&1 | FileCheck %s
 
 // Test for tensor iter_arg with two if producers - should fail with error
 // CHECK: [Error]: tensor iter_arg <block argument> of type 'tensor<64x64xf32>' at index: 1 has multiple different producers!
