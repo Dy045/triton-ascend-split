@@ -143,32 +143,49 @@ UpdateConditionInfoPass::allocSSBuffer(ModuleOp module) {
 
 // Collect dependency buffer
 void UpdateConditionInfoPass::collectDependencyBuffers(
-    scf::ForOp forOp,
+    ModuleOp module, SmallVector<scf::ForOp> &mainLoopForOps,
     DenseMap<int, DenseMap<Value, SmallVector<Value>>> &crossCoreBuffers,
     DenseMap<int, DenseMap<Operation *, SmallVector<Operation *>>>
         &memCrossCoreBuffers,
-    DenseMap<int, DenseMap<Value, SmallVector<Value>>> &intraCoreBuffers) {
+    DenseMap<scf::ForOp, DenseMap<int, DenseMap<Value, SmallVector<Value>>>>
+        &intraCoreBuffersMap) {
+  // Collect crossCoreBuffers and memCrossCoreBuffers by traversing module in
+  // deterministic order
   int crossCoreIdx = 0;
-  for (auto &entry : info->crossCoreDependentMap) {
-    crossCoreBuffers[crossCoreIdx][entry.first] = entry.second;
-    crossCoreIdx++;
-  }
-
-  // Collect memCrossCoreDependentMap with offset groupIdx
-  int memCrossCoreOffset = info->crossCoreDependentMap.size();
   int memCrossCoreIdx = 0;
-  for (auto &entry : info->memCrossCoreDependentMap) {
-    int adjustedGroupIdx = memCrossCoreOffset + memCrossCoreIdx;
-    memCrossCoreBuffers[adjustedGroupIdx][entry.first] = entry.second;
-    memCrossCoreIdx++;
-  }
+  int memCrossCoreOffset = info->crossCoreDependentMap.size();
+  module.walk([&](Operation *op) {
+    // Collect crossCoreBuffers for this op's results
+    for (Value result : op->getResults()) {
+      auto it = info->crossCoreDependentMap.find(result);
+      if (it != info->crossCoreDependentMap.end()) {
+        crossCoreBuffers[crossCoreIdx][result] = it->second;
+        crossCoreIdx++;
+      }
+    }
 
-  if (info->intraCoreDependentMap.count(forOp)) {
-    auto &forOpDeps = info->intraCoreDependentMap[forOp];
-    int intraCoreIdx = 0;
-    for (auto &entry : forOpDeps) {
-      intraCoreBuffers[intraCoreIdx][entry.first] = entry.second;
-      intraCoreIdx++;
+    // Collect memCrossCoreBuffers for this op
+    auto memIt = info->memCrossCoreDependentMap.find(op);
+    if (memIt != info->memCrossCoreDependentMap.end()) {
+      int adjustedGroupIdx = memCrossCoreOffset + memCrossCoreIdx;
+      memCrossCoreBuffers[adjustedGroupIdx][op] = memIt->second;
+      memCrossCoreIdx++;
+    }
+
+    return WalkResult::advance();
+  });
+
+  // Collect intraCoreBuffers for all forOps
+  for (scf::ForOp forOp : mainLoopForOps) {
+    if (info->intraCoreDependentMap.count(forOp)) {
+      auto &forOpDeps = info->intraCoreDependentMap[forOp];
+      DenseMap<int, DenseMap<Value, SmallVector<Value>>> intraCoreBuffers;
+      int intraCoreIdx = 0;
+      for (auto &entry : forOpDeps) {
+        intraCoreBuffers[intraCoreIdx][entry.first] = entry.second;
+        intraCoreIdx++;
+      }
+      intraCoreBuffersMap[forOp] = intraCoreBuffers;
     }
   }
 }
@@ -1616,6 +1633,16 @@ int UpdateConditionInfoPass::updateIfConds(
   if (walkResult.wasInterrupted()) {
     return UPDATE_CONDITION_INFO_FAILED;
   }
+
+  // Step0: Collect dependency buffers once outside the for loop
+  DenseMap<int, DenseMap<Value, SmallVector<Value>>> crossCoreBuffers;
+  DenseMap<int, DenseMap<Operation *, SmallVector<Operation *>>>
+      memCrossCoreBuffers;
+  DenseMap<scf::ForOp, DenseMap<int, DenseMap<Value, SmallVector<Value>>>>
+      intraCoreBuffersMap;
+  collectDependencyBuffers(module, mainLoopForOps, crossCoreBuffers,
+                           memCrossCoreBuffers, intraCoreBuffersMap);
+
   for (scf::ForOp forOp : mainLoopForOps) {
     controlVarToLatestValue.clear();
 
@@ -1624,13 +1651,12 @@ int UpdateConditionInfoPass::updateIfConds(
       return UPDATE_CONDITION_INFO_FAILED;
     }
 
-    DenseMap<int, DenseMap<Value, SmallVector<Value>>> crossCoreBuffers;
-    DenseMap<int, DenseMap<Operation *, SmallVector<Operation *>>>
-        memCrossCoreBuffers;
+    // Step1: Get intraCoreBuffers from pre-collected map
     DenseMap<int, DenseMap<Value, SmallVector<Value>>> intraCoreBuffers;
-    // Step1:Collect the dependency buffer info of this forOp
-    collectDependencyBuffers(forOp, crossCoreBuffers, memCrossCoreBuffers,
-                             intraCoreBuffers);
+    if (intraCoreBuffersMap.count(forOp)) {
+      intraCoreBuffers = intraCoreBuffersMap[forOp];
+    }
+
     if (crossCoreBuffers.empty() && memCrossCoreBuffers.empty() &&
         intraCoreBuffers.empty()) {
       LDBG("crossCoreBuffers, memCrossCoreBuffers and intraCoreBuffers are all "
