@@ -85,15 +85,13 @@ Job 默认无限等，建议加 `timeout-minutes: 60` 防止远端卡死浪费�
 | python ci.py 报错 | docker exec 返回非 0，Job fail |
 | hello.txt 不存在 | docker cp + scp 失败，Job fail |
 
-即 **ci.py 失败则门禁不通过**，PR 上会显示红 ✗。
+即 **ci.py 失败则门禁不通过**，PR 上会显示红 ✗。不做重试，不区分错误类型。
 
 ## 9. 产物保留
 
 GitHub artifact 默认保留 **90 天**，到期自动清理。如需更长时间可在 workflow 中设置 `retention-days`。
 
-## 10. pass/fail 门禁策略
-
-## 11. GitHub Secrets 配置
+## 10. GitHub Secrets 配置
 
 需在 GitHub repo → Settings → Secrets and variables → Actions 中配置：
 
@@ -103,10 +101,10 @@ GitHub artifact 默认保留 **90 天**，到期自动清理。如需更长时�
 | `DYNAMIC_CV_TEST_USER` | z00896713 |
 | `DYNAMIC_CV_TEST_PASSWORD` | a5-zhangkai |
 
-## 12. Workflow 文件
+## 11. Workflow 文件
 
 路径：`.github/workflows/dynamic-cv-pipeline-tests.yml`
 
-## 13. Agent
+## 12. Agent
 
 路径：`.claude/agents/ci-cd.md`（已创建）
