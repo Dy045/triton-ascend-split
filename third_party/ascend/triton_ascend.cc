@@ -23,6 +23,7 @@
 
 #include "ascend/include/DynamicCVPipeline/Common/BufferCountManager.h"
 #include "ascend/include/DynamicCVPipeline/Passes.h"
+#include "ascend/include/DynamicCVPipeline/AnalyzeDataFlow.h"
 
 #include "ir.h" // TritonOpBuilder
 #include "triton/Dialect/Triton/IR/Dialect.h"
@@ -433,6 +434,10 @@ void init_triton_ascend_passes_ttir(py::module &&m) {
       mlir::triton::BufferCountManager::getInstance().setBufferCount(
           mlir::triton::BufferCountManager::DepType::LoadStore, count);
     }
+  });
+
+  m.def("set_enable_dynamic_cv_flow_optimization", [](bool enable) {
+    mlir::triton::setEnableDynamicFlowOptimization(enable);
   });
 }
 
