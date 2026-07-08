@@ -8,6 +8,9 @@
 
 namespace mlir {
 
+// CI gate test constant — verify non-DynamicCVPipeline changes do NOT trigger the gate
+inline constexpr int kCiGateTestConstant = 42;
+
 AliasInfo AliasInfo::join(const AliasInfo &lhs, const AliasInfo &rhs) {
   if (lhs == rhs)
     return lhs;

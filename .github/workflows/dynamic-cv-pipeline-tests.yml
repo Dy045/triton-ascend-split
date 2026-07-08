@@ -1,16 +1,10 @@
 name: DynamicCVPipeline Tests
-# Triggered after DynamicCVPipeline Trigger completes, or manually via
-# workflow_dispatch to re-run the test alone (assumes the remote server
-# is available).
-#
-# All paths run in base-repo context, so secrets are available even for fork
-# PRs. NEVER check out the PR head SHA — fork code must not execute under
-# the secret-bearing token.
 
 on:
-  workflow_run:
-    workflows: ["DynamicCVPipeline Trigger"]
-    types: [completed]
+  pull_request:
+    paths:
+      - 'third_party/ascend/lib/DynamicCVPipeline/**'
+      - 'third_party/ascend/include/DynamicCVPipeline/**'
   workflow_dispatch:
     inputs:
       pr_id:
@@ -18,146 +12,65 @@ on:
         required: true
 
 concurrency:
-  # Serial execution — remote server resource is limited; do not cancel a
-  # running test (the in-progress SSH session would be orphaned).
-  group: dcv-pipeline-${{ inputs.pr_id || github.event.workflow_run.head_sha || github.run_id }}
+  group: dcv-pipeline-${{ github.event_name == 'workflow_dispatch' && github.run_id || 'queue' }}
   cancel-in-progress: false
 
 permissions: {}
 
 jobs:
-  remote-test:
+  build-check:
     if: >-
-      github.event_name == 'workflow_dispatch' ||
-      (github.event_name == 'workflow_run' &&
-       github.event.workflow_run.conclusion == 'success')
+      github.event_name == 'pull_request' ||
+      github.event_name == 'workflow_dispatch'
     runs-on: linux-amd64-cpu-16
-    timeout-minutes: 60
+    container:
+      image: swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/triton:8.5.0-910b-ubuntu22.04-py3.11-latest
+    timeout-minutes: 360
     permissions:
+      id-token: write
       contents: read
-      pull-requests: read
-      statuses: write
     steps:
-      # Default checkout pulls the base repo at the workflow's ref (safe).
-      # Do not pass ref: head_sha — that would execute fork code.
-      - uses: actions/checkout@v4
-
-      - name: Resolve PR context
-        id: ctx
-        shell: bash
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          set -euo pipefail
-
-          # workflow_dispatch → use input directly.
-          # workflow_run  → resolve from head repo/branch.
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            PR_ID="${{ inputs.pr_id }}"
-          else
-            HEAD_OWNER="${{ github.event.workflow_run.head_repository.owner.login }}"
-            HEAD_BRANCH="${{ github.event.workflow_run.head_branch }}"
-            NUM=$(gh api "/repos/${{ github.repository }}/pulls?state=open&head=${HEAD_OWNER}:${HEAD_BRANCH}" \
-                    --jq 'if length > 0 then .[0].number else empty end')
-            if [ -z "${NUM}" ]; then
-              echo "No open PR found for ${HEAD_OWNER}:${HEAD_BRANCH}; nothing to test."
-              echo "pr_id=" >> "$GITHUB_OUTPUT"
-              exit 0
-            fi
-            PR_ID="${NUM}"
-          fi
-
-          P=$(gh pr view "$PR_ID" --repo "${{ github.repository }}" --json headRefOid)
-          HEAD_SHA=$(echo "$P" | jq -r .headRefOid)
-
-          {
-            echo "pr_id=$PR_ID"
-            echo "head_sha=$HEAD_SHA"
-          } >> "$GITHUB_OUTPUT"
-
-      - name: Set commit status (pending)
-        if: steps.ctx.outputs.head_sha != ''
-        env:
-          GH_TOKEN: ${{ github.token }}
-          SHA: ${{ steps.ctx.outputs.head_sha }}
-          TARGET: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-        run: |
-          gh api -X POST "repos/${{ github.repository }}/statuses/${SHA}" \
-            -f state=pending \
-            -f context='DynamicCVPipeline Tests' \
-            -f description='Pipeline running' \
-            -f target_url="$TARGET"
-
-      - name: Run remote test via SSH
-        id: run
-        if: steps.ctx.outputs.pr_id != ''
-        shell: bash
-        env:
-          SSH_HOST: ${{ secrets.DYNAMIC_CV_TEST_HOST }}
-          SSH_USER: ${{ secrets.DYNAMIC_CV_TEST_USER }}
-          SSH_PASSWORD: ${{ secrets.DYNAMIC_CV_TEST_PASSWORD }}
-          PR_NUM: ${{ steps.ctx.outputs.pr_id }}
-        run: |
-          set -euo pipefail
-
-          sudo apt-get install -y sshpass expect
-
-          # Legacy KexAlgorithms required by older SSH server
-          SSH_OPTS="-o StrictHostKeyChecking=no -o KexAlgorithms=diffie-hellman-group-exchange-sha1,diffie-hellman-group14-sha1,diffie-hellman-group1-sha1 -o HostKeyAlgorithms=+ssh-rsa -o PreferredAuthentications=password,keyboard-interactive -o PasswordAuthentication=yes -o PubkeyAuthentication=no"
-
-          REMOTE_TMP="/tmp/dynamic-cv-pr-${PR_NUM}"
-
-          # Use expect to handle SSH password prompt reliably
-          run_remote() {
-            local HOST="$1"; local USER="$2"; local PASS="$3"; local CMD="$4"
-            expect -c "
-              set timeout 300
-              spawn ssh ${SSH_OPTS} ${USER}@${HOST} {${CMD}}
-              expect {
-                \"assword:\" { send \"${PASS}\r\"; exp_continue }
-                eof { catch wait result; exit [lindex \$result 3] }
-                timeout { exit 1 }
-              }
-            "
-          }
-
-          run_remote "${SSH_HOST}" "${SSH_USER}" "${SSH_PASSWORD}" "
-            docker start z00896713
-            docker exec z00896713 bash -c '
-              chmod -R a+rwX /home/z00896713
-              cd /home/z00896713/ci
-              python ci.py
-            '
-            mkdir -p ${REMOTE_TMP}
-            docker cp z00896713:/home/z00896713/ci/hello.txt ${REMOTE_TMP}/hello.txt
-          "
-
-          # Copy hello.txt back from remote
-          export SSHPASS="${SSH_PASSWORD}"
-          sshpass -e scp ${SSH_OPTS} \
-            ${SSH_USER}@${SSH_HOST}:${REMOTE_TMP}/hello.txt ./hello.txt
-
-          # Cleanup remote temp
-          run_remote "${SSH_HOST}" "${SSH_USER}" "${SSH_PASSWORD}" \
-            "rm -rf ${REMOTE_TMP}"
-
-      - name: Upload hello.txt as PR artifact
-        if: steps.ctx.outputs.pr_id != ''
-        uses: actions/upload-artifact@v4
+      - name: Checkout
+        uses: actions/checkout@v4
         with:
-          name: hello-txt-pr-${{ steps.ctx.outputs.pr_id }}
-          path: ./hello.txt
+          fetch-depth: 0
+          submodules: "true"
 
-      - name: Set commit status (final)
-        if: always() && steps.ctx.outputs.head_sha != ''
+      - name: Add git safe directory
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - name: Cache build dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.triton/llvm
+            ~/.triton/json
+            ~/.triton/nvidia
+            ${{ github.workspace }}/.ccache
+          key: ${{ runner.os }}-${{ runner.arch }}-cann8.5.0-ubuntu22.04-910b-py3.11-dcv-${{ hashFiles('cmake/llvm-hash.txt', 'cmake/json-version.txt', 'cmake/nvidia-toolchain-version.json', 'third_party/ascend/llvm_patch/*.patch') }}
+          restore-keys: ${{ runner.os }}-${{ runner.arch }}-cann8.5.0-ubuntu22.04-910b-py3.11-dcv
+
+      - name: Build triton-ascend
+        shell: bash
         env:
-          GH_TOKEN: ${{ github.token }}
-          SHA: ${{ steps.ctx.outputs.head_sha }}
-          STATE: ${{ steps.run.outcome == 'success' && 'success' || 'failure' }}
-          TARGET: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          TRITON_BUILD_WITH_CCACHE: "true"
+          TRITON_BUILD_WITH_CLANG_LLD: "TRUE"
+          TRITON_DISABLE_LINE_INFO: 1
+          CCACHE_COMPRESS: "true"
+          CCACHE_DIR: ${{ github.workspace }}/.ccache
+          TRITON_BUILD_WITH_O1: true
+          TRITON_BUILD_PROTON: OFF
+          TRITON_WHEEL_NAME: triton-ascend
+          TRITON_APPEND_CMAKE_ARGS: "-DTRITON_BUILD_UT=OFF"
         run: |
-          gh api -X POST "repos/${{ github.repository }}/statuses/${SHA}" \
-            -f state="$STATE" \
-            -f context='DynamicCVPipeline Tests' \
-            -f description="${STATE}" \
-            -f target_url="$TARGET"
+          mkdir -p "$CCACHE_DIR"
+          ccache --zero-stats
+          NUM_PROCS=$(( $(nproc) / 3 ))
+          if [ "$NUM_PROCS" -lt 1 ]; then NUM_PROCS=1; fi
+          cd python
+          MAX_JOBS="$NUM_PROCS" python setup.py bdist_wheel --dist-dir="${GITHUB_WORKSPACE}/wheelhouse"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dcv-wheels-${{ github.event.pull_request.number || inputs.pr_id }}
+          path: ./wheelhouse/*.whl
