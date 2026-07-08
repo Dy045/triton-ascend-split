@@ -25,8 +25,9 @@ PR 提上来后自动触发:
 │   ├── publish: 下载 artifact → 上传 OBS
 │   ├── trigger: POST /start → poll /query (最长 12h)
 │   └── cleanup: PR 关闭时清理 OBS
-└── dynamic-cv-pipeline-tests.yml # DynamicCVPipeline 专项门禁 (SSH 到远端 x86 跑 docker python ci.py)
-    └── remote-test: sshpass SSH → docker start/exec → python ci.py → scp hello.txt → upload PR artifact
+├── dynamic-cv-pipeline-trigger.yml # DynamicCVPipeline 轻量信号 (pull_request, paths 过滤)
+└── dynamic-cv-pipeline-tests.yml # DynamicCVPipeline 专项门禁 (workflow_run, SSH 到远端 x86)
+    └── remote-test: resolve PR → commit status → sshpass SSH → docker exec ci.py → scp hello.txt → upload artifact
 
 其他 workflow (手动/定时):
 ├── wheels.yml                  # 多平台 wheel 构建 (仅 workflow_dispatch)
@@ -95,7 +96,7 @@ jobs:
 
 ### 概览
 
-`dynamic-cv-pipeline-tests.yml` — 当 PR 修改 `lib/DynamicCVPipeline/**` 或 `include/DynamicCVPipeline/**` 时触发。
+`dynamic-cv-pipeline-tests.yml` — 由 `workflow_run` 触发（当 `dynamic-cv-pipeline-trigger.yml` 完成时），或通过 `workflow_dispatch` 手动触发。在 base-repo 上下文运行，secrets 可用。
 
 ### 远端环境
 
@@ -112,20 +113,25 @@ jobs:
 ### 流程
 
 ```
-ubuntu-latest (GitHub Actions)
-  → sshpass SSH 到 61.47.16.82
-  → docker start z00896713
-  → docker exec ... python ci.py
-  → docker cp + scp hello.txt 回 runner
-  → upload-artifact (hello-txt-pr-<NUM>)
+PR (pull_request, paths) → DynamicCVPipeline Trigger (轻量信号)
+  → workflow_run 触发 DynamicCVPipeline Tests
+    → resolve PR context (PR 号, head SHA)
+    → set commit status (pending)
+    → sshpass SSH 到 61.47.16.82
+    → docker start z00896713
+    → docker exec ... python ci.py
+    → docker cp + scp hello.txt 回 runner
+    → upload-artifact (hello-txt-pr-<NUM>)
+    → set commit status (final)
 ```
 
 ### 关键配置
 
-- **并发**: `cancel-in-progress: false`（排队串行，远端资源有限）
+- **并发**: Trigger `cancel-in-progress: true`；Tests `cancel-in-progress: false`（串行排队，远端资源有限）
 - **超时**: `timeout-minutes: 60`
-- **触发**: `pull_request` (paths) + `workflow_dispatch`
+- **触发**: `workflow_run` (DynamicCVPipeline Trigger 完成) + `workflow_dispatch`
 - **Secrets**: `DYNAMIC_CV_TEST_HOST`、`DYNAMIC_CV_TEST_USER`、`DYNAMIC_CV_TEST_PASSWORD`
+- **安全**: 不 checkout PR head SHA，所有 job 在 base-repo 上下文运行
 
 ### pass/fail 策略
 

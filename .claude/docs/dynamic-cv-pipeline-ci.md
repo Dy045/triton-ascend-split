@@ -2,36 +2,42 @@
 
 ## 1. 触发条件
 
-- **自动触发**：PR 修改以下目录时
+- **自动触发**：PR 修改以下目录时，由 `dynamic-cv-pipeline-trigger.yml` 信号 workflow 完成
+  后，`dynamic-cv-pipeline-tests.yml` 通过 `workflow_run` 自动启动
   - `third_party/ascend/lib/DynamicCVPipeline/**`
   - `third_party/ascend/include/DynamicCVPipeline/**`
-- **手动触发**：`workflow_dispatch`，可在 Actions 页面手动启动
+- **手动触发**：`workflow_dispatch`，可在 Actions 页面手动启动（需提供 `pr_id`）
 
 ## 2. 整体流程
 
+采用与 Ascend950 相同的两阶段架构，确保 fork PR 也能安全访问 secrets：
+
 ```
-PR 提交/更新 (匹配路径)
+PR 提交/更新 (匹配 DynamicCVPipeline 路径)
         │
         ▼
 ┌──────────────────────────────────────────────┐
-│  Job: remote-test (ubuntu-latest)            │
+│  Workflow 1: DynamicCVPipeline Trigger       │
+│  (pull_request, paths 过滤)                  │
 │                                              │
-│  1. 安装 sshpass                             │
-│  2. SSH 到远端服务器 (61.47.16.82)            │
-│     sshpass + 用户 z00896713                 │
+│  轻量信号 — 仅标记 "路径变更，需跑远端测试"   │
+│  cancel-in-progress: true                    │
+└──────────────────────────────────────────────┘
+        │ workflow_run (completed)
+        ▼
+┌──────────────────────────────────────────────┐
+│  Workflow 2: DynamicCVPipeline Tests         │
+│  (workflow_run / workflow_dispatch)          │
 │                                              │
-│  3. 远端执行:                                 │
-│     docker start z00896713                   │
-│     docker exec z00896713 bash -c '...'      │
-│       chmod -R a+rwX /home/z00896713         │
-│       cd /home/z00896713/ci                  │
-│       python ci.py                           │
-│                                              │
-│  4. docker cp hello.txt 到远端临时目录        │
-│  5. scp hello.txt 回到 GitHub Actions runner │
-│  6. 上传为 PR artifact                       │
-│     artifact 名: hello-txt-pr-<PR_NUMBER>    │
-│  7. 清理远端临时文件                          │
+│  在 base-repo 上下文运行，secrets 可用        │
+│  1. Resolve PR context (PR 号、head SHA)     │
+│  2. Set commit status (pending)              │
+│  3. SSH 到远端服务器                         │
+│     docker start + exec python ci.py         │
+│  4. scp hello.txt 回 runner                  │
+│  5. Upload artifact                          │
+│  6. Set commit status (final)                │
+│  cancel-in-progress: false (串行排队)        │
 └──────────────────────────────────────────────┘
 ```
 
@@ -46,7 +52,7 @@ PR 提交/更新 (匹配路径)
 | 入口脚本 | `python ci.py` |
 | 产物 | `hello.txt` |
 
-密码通过 GitHub Secret `DYNAMIC_CV_TEST_PASSWORD` 注入，**绝不硬编码在 workflow 文件中**。
+密码通过 GitHub Secret `DYNAMIC_CV_TEST_PASSWORD` 注入，**绝不硬编码在代码或文档中**。
 
 ## 4. ci.py 说明
 
@@ -68,19 +74,20 @@ PR 提交/更新 (匹配路径)
 
 ## 6. 并发策略
 
-多个 PR 同时触发时**排队串行执行**（`cancel-in-progress: false`），不会因为新 PR 提交而取消正在跑的 run。
+- **Trigger workflow**: `cancel-in-progress: true`（新 commit 取消旧信号）
+- **Tests workflow**: `cancel-in-progress: false`（串行排队，远端资源有限，不中断正在跑的 SSH 会话）
 
 手动 `workflow_dispatch` 触发时使用 `github.run_id` 作为单独的 concurrency group，不跟 PR 的排队冲突。
 
 ## 7. 超时配置
 
-Job 默认无限等，建议加 `timeout-minutes: 60` 防止远端卡死浪费资源。
+Job 设置 `timeout-minutes: 60` 防止远端卡死浪费资源。
 
 ## 8. 错误处理
 
 | 场景 | 行为 |
 |---|---|
-| SSH 连接失败 | Job 直接 fail，不重试 |
+| SSH 连接失败 | Job 直接 fail，commit status 标记 failure |
 | docker start 失败 | 远端命令返回非 0，Job fail |
 | python ci.py 报错 | docker exec 返回非 0，Job fail |
 | hello.txt 不存在 | docker cp + scp 失败，Job fail |
@@ -95,16 +102,26 @@ GitHub artifact 默认保留 **90 天**，到期自动清理。如需更长时�
 
 需在 GitHub repo → Settings → Secrets and variables → Actions 中配置：
 
-| Secret 名 | 值 |
+| Secret 名 | 说明 |
 |---|---|
-| `DYNAMIC_CV_TEST_HOST` | 61.47.16.82 |
-| `DYNAMIC_CV_TEST_USER` | z00896713 |
-| `DYNAMIC_CV_TEST_PASSWORD` | a5-zhangkai |
+| `DYNAMIC_CV_TEST_HOST` | 远端服务器 IP |
+| `DYNAMIC_CV_TEST_USER` | SSH 用户名 |
+| `DYNAMIC_CV_TEST_PASSWORD` | SSH 密码 |
 
-## 11. Workflow 文件
+## 11. 安全设计
 
-路径：`.github/workflows/dynamic-cv-pipeline-tests.yml`
+- 使用 `workflow_run` + `workflow_dispatch` 触发，所有 job 在 base-repo 上下文运行
+- **绝不** checkout PR head SHA（防止 fork 代码在 secret-bearing token 下执行）
+- Secrets 仅在 `workflow_run` 上下文中可访问，fork PR 的 `pull_request` 事件无法获取
+- 参考 Ascend950-pipeline-tests.yml 的安全模式
 
-## 12. Agent
+## 12. Workflow 文件
+
+| 文件 | 用途 |
+|---|---|
+| `.github/workflows/dynamic-cv-pipeline-trigger.yml` | 轻量信号 workflow (pull_request, paths) |
+| `.github/workflows/dynamic-cv-pipeline-tests.yml` | 实际测试 workflow (workflow_run / workflow_dispatch) |
+
+## 13. Agent
 
 路径：`.claude/agents/ci-cd.md`（已创建）

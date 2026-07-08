@@ -1,0 +1,20 @@
+name: DynamicCVPipeline Trigger
+
+on:
+  pull_request:
+    paths:
+      - 'third_party/ascend/lib/DynamicCVPipeline/**'
+      - 'third_party/ascend/include/DynamicCVPipeline/**'
+
+concurrency:
+  group: dcv-trigger-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  trigger:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "DynamicCVPipeline paths changed — triggering remote test"
