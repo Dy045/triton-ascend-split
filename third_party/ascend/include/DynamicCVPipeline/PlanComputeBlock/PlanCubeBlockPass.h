@@ -46,9 +46,9 @@ public:
   llvm::StringRef getArgument() const final { return "plan-cube-block"; }
 
 private:
-  SmallVector<Operation *> matchSeed(Operation *dotOp,
-                                     CVPipeline::ComputeBlockIdManager &bm,
-                                     const CVPipeline::MemoryDependenceGraph &memGraph);
+  SmallVector<Operation *>
+  matchSeed(Operation *dotOp, CVPipeline::ComputeBlockIdManager &bm,
+            const CVPipeline::MemoryDependenceGraph &memGraph);
   llvm::LogicalResult
   processBlockWithCubeBFS(Block *block,
                           const CVPipeline::MemoryDependenceGraph &memGraph,

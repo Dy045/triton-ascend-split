@@ -351,8 +351,10 @@ bool InterCoreTransferAndSyncPass::matmulCIsEmpty(mlir::Value acc) {
       if (auto constOp = fillVal.getDefiningOp<arith::ConstantOp>()) {
         Attribute attr = constOp.getValue();
 
-        if ((isa<FloatAttr>(attr) && cast<FloatAttr>(attr).getValue().isZero()) ||
-            (isa<IntegerAttr>(attr) && cast<IntegerAttr>(attr).getValue().isZero())) {
+        if ((isa<FloatAttr>(attr) &&
+             cast<FloatAttr>(attr).getValue().isZero()) ||
+            (isa<IntegerAttr>(attr) &&
+             cast<IntegerAttr>(attr).getValue().isZero())) {
           return true;
         }
       }
@@ -373,8 +375,8 @@ void InterCoreTransferAndSyncPass::extractMatmulResult(
   auto rhsType = cast<RankedTensorType>(rhs.getType());
   auto accType = cast<RankedTensorType>(acc.getType());
   auto resType = cast<RankedTensorType>(originalResult.getType());
-  if (lhsType.getShape()[0] == accType.getShape()[0]
-      && rhsType.getShape()[1] == accType.getShape()[1]) {
+  if (lhsType.getShape()[0] == accType.getShape()[0] &&
+      rhsType.getShape()[1] == accType.getShape()[1]) {
     return;
   }
 
@@ -452,8 +454,7 @@ void InterCoreTransferAndSyncPass::extractMatmulResult(
 void InterCoreTransferAndSyncPass::rewriteMatmulWithNewShape(
     OpBuilder &builder, Operation *matmulOp, Location loc, bool isMatmulA,
     bool isMatmulB, bool matmulPadding, bool isOnlyDepInMatmul) {
-  int matmulOpBlockId =
-      CVPipeline::getOpBlockId(matmulOp).value_or(-1);
+  int matmulOpBlockId = CVPipeline::getOpBlockId(matmulOp).value_or(-1);
 
   if (matmulPadding) {
     int matmulIndex = isMatmulA ? 1 : 0;
@@ -477,10 +478,8 @@ void InterCoreTransferAndSyncPass::rewriteTransposeWithNewShape(
   // Create new empty tensor with new shape
   auto tensorEmptyOp =
       builder.create<tensor::EmptyOp>(loc, newOutputShape, elemType);
-  attachCommonTags(
-      tensorEmptyOp,
-      CVPipeline::getOpBlockId(transposeOp).value_or(-1),
-      "CUBE");
+  attachCommonTags(tensorEmptyOp,
+                   CVPipeline::getOpBlockId(transposeOp).value_or(-1), "CUBE");
   Value transposeOpResult = transposeOp->getResult(0);
   transposeOp->setOperand(1, tensorEmptyOp.getResult());
   transposeOp->getResult(0).setType(expectedType);
@@ -708,8 +707,7 @@ InterCoreTransferAndSyncPass::createTransferAllocs(
     consAllocOp = builder.create<memref::AllocOp>(loc, allocType);
     auto markConsOp = annotateTightlyCoupledBuffer(builder, consAllocOp, loc);
 
-    int loopBlockId =
-        CVPipeline::getOpBlockId(mainLoopOp).value_or(-1);
+    int loopBlockId = CVPipeline::getOpBlockId(mainLoopOp).value_or(-1);
     attachTransferTags(prodAllocOp, loopBlockId, prodTag, transferIndex);
     attachTransferTags(consAllocOp, loopBlockId, consTag, transferIndex);
     attachTransferTags(markProdOp, loopBlockId, prodTag, transferIndex);
@@ -769,7 +767,8 @@ InterCoreTransferAndSyncPass::getConsumerWaitPoint(int transferIndex) {
         !isa<memref::MemorySpaceCastOp>(op) && !isa<LLVM::LoadOp>(op)) {
       return;
     }
-    auto transferIdAttr = op->getAttrOfType<IntegerAttr>(CVPipeline::kTransferId);
+    auto transferIdAttr =
+        op->getAttrOfType<IntegerAttr>(CVPipeline::kTransferId);
     if (transferIdAttr && transferIdAttr.getInt() == transferIndex) {
       consumerWaitPoint = op;
     }

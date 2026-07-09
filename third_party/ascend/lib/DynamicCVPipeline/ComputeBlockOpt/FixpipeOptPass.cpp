@@ -20,10 +20,10 @@
  * THE SOFTWARE.
  */
 
-#include <optional>
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/raw_ostream.h"
+#include <optional>
 
 #include "mlir/Analysis/TopologicalSortUtils.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
@@ -468,21 +468,20 @@ bool FixpipeOptPass::isFixpipeCastPattern(Operation *truncOp,
   return true;
 }
 
-std::optional<Operation *> getOneUserExceptMarkOp(Operation *op)
-{
-    int count = 0;
-    Operation *onlyUser = nullptr;
-    for (auto user : op->getUsers()) {
-        if (!isa<annotation::MarkOp>(user)) {
-            count += 1;
-            onlyUser = user;
-        }
+std::optional<Operation *> getOneUserExceptMarkOp(Operation *op) {
+  int count = 0;
+  Operation *onlyUser = nullptr;
+  for (auto user : op->getUsers()) {
+    if (!isa<annotation::MarkOp>(user)) {
+      count += 1;
+      onlyUser = user;
     }
-    if (count != 1) {
-        return std::nullopt;
-    } else {
-        return onlyUser;
-    }
+  }
+  if (count != 1) {
+    return std::nullopt;
+  } else {
+    return onlyUser;
+  }
 }
 
 /** Fixpipe supports scaling, the pattern should be like below:
@@ -510,15 +509,13 @@ bool FixpipeOptPass::isFixpipeMulPattern(Operation *mulOp,
     matchedOps.insert(extractSliceOp);
   }
 
-  if (extractSliceOp &&
-      !getOneUserExceptMarkOp(extractSliceOp).has_value()) {
+  if (extractSliceOp && !getOneUserExceptMarkOp(extractSliceOp).has_value()) {
     LOG_DEBUG("Extract Slice not only one user, NOT match.");
     return false;
   }
 
-  auto storeOp = extractSliceOp
-                     ? getOneUserExceptMarkOp(extractSliceOp).value()
-                     : maybeExtract;
+  auto storeOp = extractSliceOp ? getOneUserExceptMarkOp(extractSliceOp).value()
+                                : maybeExtract;
   matchedOps.insert(mulOp);
   if (!isStoreToGM(storeOp, matchedOps)) {
     LOG_DEBUG("Not store to GM pattern, NOT match.");

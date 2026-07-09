@@ -238,7 +238,8 @@ static scf::IfOp createIfOpForBlock(OpBuilder &builder, Location loc,
   ifOp->setAttr(kSSBufferIfAttr, builder.getI32IntegerAttr(blockId));
 
   // notify npuir that of the scenario
-  ifOp->setAttr(CVPipeline::kHIVMMatmulLimitedInCubeAttr, builder.getUnitAttr());
+  ifOp->setAttr(CVPipeline::kHIVMMatmulLimitedInCubeAttr,
+                builder.getUnitAttr());
 
   return ifOp;
 }

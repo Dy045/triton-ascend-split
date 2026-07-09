@@ -92,7 +92,8 @@ llvm::LogicalResult verifyOpBlockId(Operation *op);
 int getAvailableBlockId(ModuleOp module);
 void setFallbackAttr(ModuleOp module);
 bool isScfOp(Operation *op);
-bool isOnlyDirectlyUse(Operation *preOp, Operation *nextOp, const CVPipeline::MemoryDependenceGraph &memGraph);
+bool isOnlyDirectlyUse(Operation *preOp, Operation *nextOp,
+                       const CVPipeline::MemoryDependenceGraph &memGraph);
 
 inline bool isCubeOp(Operation *op) {
   return !isScfOp(op) && CVPipeline::getOpCoreType(op) == CoreType::CUBE_ONLY;

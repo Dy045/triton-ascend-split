@@ -556,7 +556,6 @@ UpdateConditionInfoPass::computeVectorSSBufferPtrs(
     return std::nullopt;
   }
 
-
   // Collect all unique group indices
   SmallVector<int> allGroupIndices;
   DenseSet<int> uniqueIndices;

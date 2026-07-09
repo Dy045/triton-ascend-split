@@ -23,9 +23,9 @@
 #include "ascend/include/DynamicCVPipeline/AddControlFlowCondition.h"
 #include "ascend/include/DynamicCVPipeline/AddControlFlowCondition/CloneOps.h"
 #include "ascend/include/DynamicCVPipeline/AddControlFlowCondition/CreateIfOps.h"
+#include "ascend/include/DynamicCVPipeline/AddControlFlowCondition/FlowOpt.h"
 #include "ascend/include/DynamicCVPipeline/AddControlFlowCondition/InitDependentMap.h"
 #include "ascend/include/DynamicCVPipeline/AddControlFlowCondition/ProcessArgs.h"
-#include "ascend/include/DynamicCVPipeline/AddControlFlowCondition/FlowOpt.h"
 #include "ascend/include/DynamicCVPipeline/AddControlFlowCondition/UpdateConditionInfo.h"
 #include "ascend/include/DynamicCVPipeline/AddControlFlowCondition/UpdateForOps.h"
 #include "ascend/include/DynamicCVPipeline/AddControlFlowCondition/UpdateLoopIterTimes.h"
@@ -142,7 +142,6 @@ void registerAddControlFlowConditionPasses() {
   registerPass(createUpdateForOpsPass);
   registerPass(createFlowOptPass);
   registerPass(createAddControlFlowConditionPass);
-}
 }
 } // namespace triton
 } // namespace mlir

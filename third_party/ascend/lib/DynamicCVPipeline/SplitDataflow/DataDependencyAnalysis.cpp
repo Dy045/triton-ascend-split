@@ -21,9 +21,9 @@
  */
 
 #include "ascend/include/DynamicCVPipeline/SplitDataflow/DataDependencyAnalysis.h"
-#include "ascend/include/DynamicCVPipeline/SplitDataflow/Utils.h"
 #include "ascend/include/DynamicCVPipeline/Common/MemoryEffectsTracker.h"
 #include "ascend/include/DynamicCVPipeline/Common/Utils.h"
+#include "ascend/include/DynamicCVPipeline/SplitDataflow/Utils.h"
 
 #include "bishengir/Dialect/Annotation/IR/Annotation.h"
 #include "mlir/Analysis/AliasAnalysis.h"

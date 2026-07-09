@@ -22,8 +22,8 @@
  */
 
 #include "ascend/include/DynamicCVPipeline/SplitDataflow/AddBlockIdForControlOps.h"
-#include "ascend/include/DynamicCVPipeline/SplitDataflow/Utils.h"
 #include "ascend/include/DynamicCVPipeline/Common/Utils.h"
+#include "ascend/include/DynamicCVPipeline/SplitDataflow/Utils.h"
 #include "llvm/Support/Debug.h"
 
 using namespace mlir;

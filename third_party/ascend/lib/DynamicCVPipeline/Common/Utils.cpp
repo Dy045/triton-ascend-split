@@ -19,13 +19,9 @@ namespace CVPipeline {
 
 static bool g_enableCubeBlockMerge = true;
 
-void setEnableCubeBlockMerge(bool enable) {
-  g_enableCubeBlockMerge = enable;
-}
+void setEnableCubeBlockMerge(bool enable) { g_enableCubeBlockMerge = enable; }
 
-bool isCubeBlockMergeEnabled() {
-  return g_enableCubeBlockMerge;
-}
+bool isCubeBlockMergeEnabled() { return g_enableCubeBlockMerge; }
 
 CoreType getOpCoreType(Operation *op) {
   if (!op) {
@@ -63,7 +59,7 @@ llvm::LogicalResult verifyOpBlockId(Operation *op) {
   return llvm::success();
 }
 
-std::optional<int64_t> getOpBlockId(Operation *op) {
+std::optional<int> getOpBlockId(Operation *op) {
   if (!op) {
     return std::nullopt;
   }
@@ -72,7 +68,7 @@ std::optional<int64_t> getOpBlockId(Operation *op) {
     return std::nullopt;
   }
 
-  return blockIdAttr.getInt();
+  return static_cast<int>(blockIdAttr.getInt());
 }
 
 int getAvailableBlockId(ModuleOp module) {
@@ -113,19 +109,20 @@ bool isScfOp(Operation *op) {
 }
 
 // Check nextOp is only user of preOp
-bool isOnlyDirectlyUse(Operation *preOp, Operation *nextOp, const CVPipeline::MemoryDependenceGraph &memGraph) {
-    if (!preOp || !nextOp) {
-        return false;
-    }
-    SmallVector<Operation *> allusers;
-    allusers.append(preOp->getUsers().begin(), preOp->getUsers().end());
-    for (auto memUser : memGraph.getExecAfter(preOp)) {
-        allusers.push_back(memUser);
-    }
-    if (allusers.size() != 1) {
-        return false;
-    }
-    return (*allusers.begin()) == nextOp;
+bool isOnlyDirectlyUse(Operation *preOp, Operation *nextOp,
+                       const CVPipeline::MemoryDependenceGraph &memGraph) {
+  if (!preOp || !nextOp) {
+    return false;
+  }
+  SmallVector<Operation *> allusers;
+  allusers.append(preOp->getUsers().begin(), preOp->getUsers().end());
+  for (auto memUser : memGraph.getExecAfter(preOp)) {
+    allusers.push_back(memUser);
+  }
+  if (allusers.size() != 1) {
+    return false;
+  }
+  return (*allusers.begin()) == nextOp;
 }
 
 } // namespace CVPipeline

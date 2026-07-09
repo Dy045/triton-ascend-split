@@ -32,7 +32,7 @@ namespace triton {
 void setOpBlockId(mlir::Operation *op, int blockId);
 void setOpCoreType(mlir::Operation *op, llvm::StringRef coreType);
 
-}
-}
+} // namespace triton
+} // namespace mlir
 
 #endif // TRITON_ADAPTER_SPLIT_DATAFLOW_UTILS_H

@@ -80,7 +80,6 @@ void registerComputeBlockOptPasses() {
   registerPass(createMergeCubeForBlockPass);
   registerPass(createFixpipeOptPass);
 }
-}
 
 } // namespace triton
 } // namespace mlir

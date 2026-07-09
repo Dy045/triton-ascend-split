@@ -171,9 +171,10 @@ std::unique_ptr<OperationPass<ModuleOp>> createAddMultiBufferToGMLoadPass() {
   return std::make_unique<AddMultiBufferToGMLoadPass>();
 }
 
-void registerAddMultiBufferToGMLoadPasses()
-{
-  registerPass([]() -> std::unique_ptr<mlir::Pass> { return createAddMultiBufferToGMLoadPass(); });
+void registerAddMultiBufferToGMLoadPasses() {
+  registerPass([]() -> std::unique_ptr<mlir::Pass> {
+    return createAddMultiBufferToGMLoadPass();
+  });
 }
 
 } // namespace triton

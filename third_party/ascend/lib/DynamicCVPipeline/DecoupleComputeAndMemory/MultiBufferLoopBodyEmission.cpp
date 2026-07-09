@@ -553,10 +553,10 @@ static LogicalResult validateGroupEmissionInputs(
     return failure();
   }
   if (groupIdx < 0 || static_cast<size_t>(groupIdx) >= numGroups) {
-    origForOp.emitError() << "[" << DEBUG_TYPE << "] load group index "
-                          << groupIdx
-                          << " is out of range for multi-buffer emission (numGroups="
-                          << numGroups << ")";
+    origForOp.emitError()
+        << "[" << DEBUG_TYPE << "] load group index " << groupIdx
+        << " is out of range for multi-buffer emission (numGroups=" << numGroups
+        << ")";
     return failure();
   }
   return success();

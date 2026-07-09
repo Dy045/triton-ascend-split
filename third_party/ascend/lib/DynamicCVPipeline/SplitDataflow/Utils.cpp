@@ -30,14 +30,15 @@
 using namespace mlir;
 using namespace llvm;
 
-void triton::setOpBlockId(mlir::Operation *op, int blockId)
-{
-    static constexpr int kIntegerBitWidth = 32;
-    op->setAttr(CVPipeline::kBlockId,
-                IntegerAttr::get(IntegerType::get(op->getContext(), kIntegerBitWidth), blockId));
+void triton::setOpBlockId(mlir::Operation *op, int blockId) {
+  static constexpr int kIntegerBitWidth = 32;
+  op->setAttr(
+      CVPipeline::kBlockId,
+      IntegerAttr::get(IntegerType::get(op->getContext(), kIntegerBitWidth),
+                       blockId));
 }
 
-void triton::setOpCoreType(mlir::Operation *op, llvm::StringRef coreType)
-{
-    op->setAttr(CVPipeline::kCoreType, StringAttr::get(op->getContext(), coreType));
+void triton::setOpCoreType(mlir::Operation *op, llvm::StringRef coreType) {
+  op->setAttr(CVPipeline::kCoreType,
+              StringAttr::get(op->getContext(), coreType));
 }
