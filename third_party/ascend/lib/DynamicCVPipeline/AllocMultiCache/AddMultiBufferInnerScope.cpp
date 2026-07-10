@@ -1686,8 +1686,8 @@ static BufferMap insertBuffersBeforeFor(mlir::scf::ForOp forOp,
   OpBuilder insertedBuffers(builder.getContext());
   insertedBuffers.setInsertionPoint(parentBlock, forOp->getIterator());
 
-  using BufferCountManager = mlir::triton::BufferCountManager;
-  int bufNum = BufferCountManager::getInstance().getBufferCountByType(
+  BufferCountManager bufferCountMgr(forOp);
+  int bufNum = bufferCountMgr.getBufferCountByType(
       BufferCountManager::DepType::IntraCore);
 
   for (Value depVal : valueList) {

@@ -169,10 +169,17 @@ private:
 
   int updateForOpYield(scf::ForOp forOp);
 
+<<<<<<< HEAD
   int combineConditions(ModuleOp module, Value crossCoreCond,
                         Value intraCoreCond, scf::IfOp ifOp, scf::ForOp forOp,
                         size_t &usedCounterNum,
                         DenseMap<Value, VarUpdateType> &varUpdateTypes);
+=======
+  int combineConditions(ModuleOp module, Value crossCoreCond,
+                        Value intraCoreCond, Value flowOptCond, scf::IfOp ifOp,
+                        scf::ForOp forOp, size_t &usedCounterNum,
+                        DenseMap<Value, VarUpdateType> &varUpdateTypes);
+>>>>>>> 1a86432f6 ([ssbuffer](fix) Add applicable scenarios for FlowOpt (#977))
 
   int setCrossCoreCondition(
       SmallVector<int> crossCoreInputValues,
@@ -182,6 +189,13 @@ private:
           &memCrossCoreBuffers,
       scf::IfOp ifOp, SmallVector<SmallVector<Value>> ssbufferPtrs,
       Value &crossCoreCond);
+
+  // Set the FlowOpt extra condition for the third if block in the DAG
+  int setFlowOptCondition(scf::IfOp currentIfOp, scf::ForOp forOp,
+                          Value &flowOptCond);
+
+  // Update DAG nodes after ifOp replacement
+  void updateDAGAfterIfOpReplacement(scf::IfOp oldIfOp, scf::IfOp newIfOp);
 
   // Helper function to get pointer based on core type
   Value getSSBufferPtr(bool isAIC, int groupIdx, int ptrSetIdx,
