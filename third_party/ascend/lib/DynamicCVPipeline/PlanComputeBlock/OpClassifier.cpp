@@ -40,8 +40,8 @@
 #include "mlir/Interfaces/ViewLikeInterface.h"
 #include "mlir/Support/LLVM.h"
 
-#include "ascend/include/DynamicCVPipeline/PlanComputeBlock/OpClassifier.h"
 #include "ascend/include/DynamicCVPipeline/Common/Utils.h"
+#include "ascend/include/DynamicCVPipeline/PlanComputeBlock/OpClassifier.h"
 
 #include "bishengir/Dialect/Annotation/IR/Annotation.h"
 #include "bishengir/Dialect/Utils/Util.h"
@@ -1362,7 +1362,8 @@ OpCoreType OpClassifierPass::getForInitCoreType(OpOperand *operand) const {
 // Both cores cannot share the same op instance.
 // Solution: clone the op into two versions.
 //   - Original op  -> reclassified as OP_CUBE_ONLY  -> CUBE users keep using it
-//   - Cloned op    -> classified as OP_VECTOR_ONLY -> VECTOR users switched to it
+//   - Cloned op    -> classified as OP_VECTOR_ONLY -> VECTOR users switched to
+//   it
 // Example
 //       shared_fill (CUBE_AND_VECTOR)
 //          ->             ->

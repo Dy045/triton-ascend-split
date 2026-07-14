@@ -10,12 +10,12 @@ module attributes {hacc.target = #hacc.target<"Ascend950PR_9579">} {
     %c5 = arith.constant {ssbuffer.block_id = 1} 5 : i32
     %true = arith.constant true
     %false = arith.constant false
-    
+
     scope.scope : () -> () {
       // Create initial tensor
       %tensor_init = tensor.empty() {ssbuffer.block_id = 1} : tensor<64x64xf32>
       %filled_tensor = linalg.fill {ssbuffer.block_id = 1} ins(%cst : f32) outs(%tensor_init : tensor<64x64xf32>) -> tensor<64x64xf32>
-      
+
       // Loop with tensor iter_arg
       %result = scf.for %i = %c0 to %c5 step %c1 iter_args(%iter_arg = %filled_tensor) -> (tensor<64x64xf32>) : i32 {
         // First if that yields the tensor
@@ -26,7 +26,7 @@ module attributes {hacc.target = #hacc.target<"Ascend950PR_9579">} {
         } else {
           scf.yield %iter_arg : tensor<64x64xf32>
         } {ssbuffer.if = 2 : i32}
-        
+
         // Second if that also yields the tensor
         %val2 = scf.if %false -> (tensor<64x64xf32>) {
           %new_tensor2 = tensor.empty() {ssbuffer.block_id = 3} : tensor<64x64xf32>
@@ -35,14 +35,14 @@ module attributes {hacc.target = #hacc.target<"Ascend950PR_9579">} {
         } else {
           scf.yield %iter_arg : tensor<64x64xf32>
         } {ssbuffer.if = 3 : i32}
-        
+
         // Yield from loop
         scf.yield %val2 : tensor<64x64xf32>
       } {ssbuffer.block_id = 10, ssbuffer.main_loop = 0 : i32}
-      
+
       scope.return
     } {hivm.tcore_type = #hivm.tcore_type<VECTOR>}
-    
+
     return {ssbuffer.core_type = "VECTOR"}
   }
 }

@@ -585,7 +585,8 @@ static std::optional<SplitInfo> shouldSplit(linalg::MatmulOp matmulOp,
   Value outerInValue = matmulInput.bias;
   auto outerOutValue = searchInArgsChain(
       matmulOp.getResult(0), argsLimitedInMatmul, mayNotExec, outerInValue);
-  if (utils::getAnnotateOpWithAttr(outerOutValue, kMatmulAtLeastOnceHint).has_value()) {
+  if (utils::getAnnotateOpWithAttr(outerOutValue, kMatmulAtLeastOnceHint)
+          .has_value()) {
     mayNotExec = false;
   }
   if (!argsLimitedInMatmul) {
@@ -763,15 +764,16 @@ SplitMatmulPattern::matchAndRewrite(linalg::MatmulOp matmulOp,
   LOG_DEBUG("-------------------");
   matmulOp->setAttr(CVPipeline::kLoopCarriedL0C, rewriter.getUnitAttr());
 
-  if (auto markOpOpt = utils::getAnnotateOpWithAttr(splitInfo.outerOutValue, kMatmulAtLeastOnceHint);
-      markOpOpt.has_value())
-  {
-      auto markOp = markOpOpt.value();
-      markOp->removeAttr(kMatmulAtLeastOnceHint);
-      if (markOp->getAttrs().empty()) {
-          rewriter.eraseOp(markOpOpt.value());
-      }
-      matmulOp->getParentOp()->setAttr(CVPipeline::kHIVMMatmulLimitedInCubeAttr, rewriter.getUnitAttr());
+  if (auto markOpOpt = utils::getAnnotateOpWithAttr(splitInfo.outerOutValue,
+                                                    kMatmulAtLeastOnceHint);
+      markOpOpt.has_value()) {
+    auto markOp = markOpOpt.value();
+    markOp->removeAttr(kMatmulAtLeastOnceHint);
+    if (markOp->getAttrs().empty()) {
+      rewriter.eraseOp(markOpOpt.value());
+    }
+    matmulOp->getParentOp()->setAttr(CVPipeline::kHIVMMatmulLimitedInCubeAttr,
+                                     rewriter.getUnitAttr());
   }
 
   if (splitInfo.shouldSplit) {

@@ -36,6 +36,7 @@ namespace triton {
 // Maximum number of flag allocation attempts per transfer group
 static constexpr int kMaxFlagAttempts = 16;
 static constexpr int kMaxTotalFlags = 15;
+static constexpr int kFlagThresholdSingleBuffer = 7;
 
 // --- Attribute helpers ---
 

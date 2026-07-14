@@ -22,7 +22,7 @@ module attributes {hacc.target = #hacc.target<"Ascend950PR_9579">} {
         // Create a separate tensor for yield
         %yield_tensor = tensor.empty() {ssbuffer.block_id = 2} : tensor<64x64xf32>
         %filled_yield = linalg.fill {ssbuffer.block_id = 2} ins(%cst : f32) outs(%yield_tensor : tensor<64x64xf32>) -> tensor<64x64xf32>
-        
+
         // Only consumer if op 1 - uses iter_arg but yields other value
         %val1 = scf.if %true -> (tensor<64x64xf32>) {
           // Use iter_arg in some operation (consumer) - use broadcast with empty dimensions

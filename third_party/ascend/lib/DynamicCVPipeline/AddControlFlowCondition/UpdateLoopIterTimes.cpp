@@ -434,13 +434,16 @@ std::pair<int, int> UpdateLoopIterTimesPass::calculateFactor(scf::ForOp forOp) {
     }
   }
 
-  // Step3: Calculate factor based on iteration dependencies (tensor iter_args dependencies)
+  // Step3: Calculate factor based on iteration dependencies (tensor iter_args
+  // dependencies)
   bool hasIterDeps = info->tensorIterArgDepsMap.count(forOp) &&
                      !info->tensorIterArgDepsMap[forOp].empty();
 
   if (hasIterDeps) {
-    LDBG("find cross-iteration dependency, size: " << info->tensorIterArgDepsMap[forOp].size());
-    auto [iterRequiredBuffers, iterX] = calculateIterDepsFactor(forOp, ifOps, ifOpIndex);
+    LDBG("find cross-iteration dependency, size: "
+         << info->tensorIterArgDepsMap[forOp].size());
+    auto [iterRequiredBuffers, iterX] =
+        calculateIterDepsFactor(forOp, ifOps, ifOpIndex);
     if (iterRequiredBuffers == -1 || iterX == -1) {
       LDBG("calculateIterDepsFactor failed!");
       return {-1, -1};
@@ -700,17 +703,16 @@ std::pair<int, int> UpdateLoopIterTimesPass::calculateCrossDepsFactor(
   return {maxRequiredBuffers, maxX};
 }
 
-// calculateIterDepsFactor computes the buffer factor based on iteration dependencies
-// For iter deps: consumer and producer are IfOps within the same forOp
-// Core idea: iteration dependencies are special - consume first, then produce
-// So if consumer ifOp (m) and producer ifOp (n) have dependency,
-// we need (n - m) buffers to support the loop extension
-// This function iterates all dependencies from tensorIterArgDepsMap and finds the maximum required buffer count
+// calculateIterDepsFactor computes the buffer factor based on iteration
+// dependencies For iter deps: consumer and producer are IfOps within the same
+// forOp Core idea: iteration dependencies are special - consume first, then
+// produce So if consumer ifOp (m) and producer ifOp (n) have dependency, we
+// need (n - m) buffers to support the loop extension This function iterates all
+// dependencies from tensorIterArgDepsMap and finds the maximum required buffer
+// count
 std::pair<int, int> UpdateLoopIterTimesPass::calculateIterDepsFactor(
-    scf::ForOp forOp,
-    SmallVector<scf::IfOp> &ifOps,
-    DenseMap<Operation *, int> &ifOpIndex)
-{
+    scf::ForOp forOp, SmallVector<scf::IfOp> &ifOps,
+    DenseMap<Operation *, int> &ifOpIndex) {
   int maxRequiredBuffers = 1;
   int maxX = 1;
 
@@ -755,7 +757,8 @@ std::pair<int, int> UpdateLoopIterTimesPass::calculateIterDepsFactor(
       int m = consumerIt->second;
 
       if (n <= m) {
-        LDBG("Producer IfOp index (n) is not greater than consumer IfOp index (m)!");
+        LDBG("Producer IfOp index (n) is not greater than consumer IfOp index "
+             "(m)!");
         LDBG("arg value: " << relation.iterArg);
         LDBG("Producer IfOp index n: " << n);
         LDBG("consumer IfOp index m: " << m);

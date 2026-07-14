@@ -475,6 +475,7 @@ LogicalResult UpdateForOpsPass::insertInterCorePipeS(ModuleOp module) {
 // in the main_loop and ssbuffer.if
 LogicalResult UpdateForOpsPass::analyzeTensorIterArgDependencies(
     ModuleOp module, ControlFlowConditionInfo *info) {
+  bool failed = false;
   module.walk([&](Operation *op) -> WalkResult {
     if (!op->hasAttr(kSsbufferMainLoop)) {
       return WalkResult::advance();
@@ -533,32 +534,43 @@ LogicalResult UpdateForOpsPass::analyzeTensorIterArgDependencies(
         if (isProducer) {
           if (producerIfOp && producerIfOp != ifOp) {
             // Found a different producer ifOp! This is an error.
-            LDBG("[Error]: tensor iter_arg " << iterArg << " has multiple different producers!\n");
+            LDBG("[Error]: tensor iter_arg "
+                 << iterArg << " has multiple different producers!\n");
             LDBG("Existing producer: " << producerIfOp << "\n");
             LDBG("New producer: " << ifOp << "\n");
             failed = true;
             return WalkResult::interrupt();
           }
           producerIfOp = ifOp;
-          if (inConsumer) {
+          // Check if this ifOp was previously a consumer
+          auto it = llvm::find(consumerIfOps, ifOp);
+          if (it != consumerIfOps.end()) {
             // Was consumer, now need to upgrade to producer (this is the only
             // update case)
-            consumerIfOps.erase(llvm::find(consumerIfOps, ifOp));
+            consumerIfOps.erase(it);
             LDBG("  ifOp was consumer, now updated to producer: " << ifOp
                                                                   << "\n");
           } else {
             LDBG("Found producer ifOp (first time): " << ifOp << "\n");
           }
+        } else {
+          // isConsumer
+          if (producerIfOp == ifOp) {
+            // Already a producer, even if current use is consumer, do nothing
+            continue;
+          }
+          if (!llvm::is_contained(consumerIfOps, ifOp)) {
+            consumerIfOps.push_back(ifOp);
+            LDBG("Found consumer ifOp (first time): " << ifOp << "\n");
+          }
+          // Else: already a consumer, do nothing
         }
-        // Note: if already in producer, do nothing even if current use is
-        // consumer
       }
       // Check: must have both producers AND consumers
       if (!producerIfOp || consumerIfOps.empty()) {
-        LDBG("[Warning]: tensor iter_arg " << iterArg << " has only "
-                                            << (!producerIfOp ? "consumers"
-                                                              : "producers")
-                                            << ", skipped\n");
+        LDBG("[Warning]: tensor iter_arg "
+             << iterArg << " has only "
+             << (!producerIfOp ? "consumers" : "producers") << ", skipped\n");
         continue;
       }
       TensorIterArgIfOpRelation relation;
