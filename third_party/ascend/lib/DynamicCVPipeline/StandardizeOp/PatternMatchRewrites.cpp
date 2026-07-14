@@ -22,10 +22,10 @@
 
 #include "llvm/Support/Debug.h"
 
+#include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
-#include "mlir/Dialect/Func/IR/FuncOps.h"
 
 #include "ascend/include/DynamicCVPipeline/StandardizeOp/PatternMatchRewrites.h"
 
@@ -34,46 +34,46 @@ using namespace triton;
 using namespace CVSplit;
 
 static constexpr const char *DEBUG_TYPE = "PatternMatchRewrites";
-#define LOG_DEBUG(...) LLVM_DEBUG(llvm::dbgs() << "\n[" << DEBUG_TYPE << "] " << __VA_ARGS__ << "\n")
+#define LOG_DEBUG(...)                                                         \
+  LLVM_DEBUG(llvm::dbgs() << "\n[" << DEBUG_TYPE << "] " << __VA_ARGS__ << "\n")
 
-static constexpr llvm::StringLiteral needSplitAllFuncNme[] {""};
+static constexpr llvm::StringLiteral needSplitAllFuncNme[]{""};
 
-void PatternMatchRewritePass::runOnOperation()
-{
-    auto moduleOp = getOperation();
-    LOG_DEBUG("Input mlir:\n" << moduleOp);
+void PatternMatchRewritePass::runOnOperation() {
+  auto moduleOp = getOperation();
+  LOG_DEBUG("Input mlir:\n" << moduleOp);
 
-    bool needSplitAll = false;
-    moduleOp.walk([&](func::FuncOp funcOp) -> WalkResult {
-        if (!llvm::is_contained(needSplitAllFuncNme, funcOp.getSymName())) {
-        return WalkResult::advance();
-        }
-        LOG_DEBUG("[INFO] Matmul should split anyway: " << funcOp.getSymName());
-        needSplitAll = true;
-        return WalkResult::interrupt();
-    });
-
-    auto *ctx = &getContext();
-    RewritePatternSet patterns(ctx);
-    patterns.add<SplitMatmulPattern>(ctx, needSplitAll);
-
-    // the way we handle matmul dependencies across for blocks
-    // requres the patternmatching to go top-down
-    GreedyRewriteConfig config = GreedyRewriteConfig();
-    config.useTopDownTraversal = true;
-    if (llvm::failed(applyPatternsAndFoldGreedily(moduleOp, std::move(patterns), config))) {
-        LOG_DEBUG("matchAndRewrite does not converge!");
-        signalPassFailure();
-        return;
+  bool needSplitAll = false;
+  moduleOp.walk([&](func::FuncOp funcOp) -> WalkResult {
+    if (!llvm::is_contained(needSplitAllFuncNme, funcOp.getSymName())) {
+      return WalkResult::advance();
     }
-    LOG_DEBUG("Output mlir:\n" << moduleOp);
+    LOG_DEBUG("[INFO] Matmul should split anyway: " << funcOp.getSymName());
+    needSplitAll = true;
+    return WalkResult::interrupt();
+  });
+
+  auto *ctx = &getContext();
+  RewritePatternSet patterns(ctx);
+  patterns.add<SplitMatmulPattern>(ctx, needSplitAll);
+
+  // the way we handle matmul dependencies across for blocks
+  // requres the patternmatching to go top-down
+  GreedyRewriteConfig config = GreedyRewriteConfig();
+  config.useTopDownTraversal = true;
+  if (llvm::failed(applyPatternsAndFoldGreedily(moduleOp, std::move(patterns),
+                                                config))) {
+    LOG_DEBUG("matchAndRewrite does not converge!");
+    signalPassFailure();
+    return;
+  }
+  LOG_DEBUG("Output mlir:\n" << moduleOp);
 }
 
 namespace mlir::triton::CVSplit {
 
-std::unique_ptr<OperationPass<ModuleOp>> createPatternMatchRewritePass()
-{
-    return std::make_unique<PatternMatchRewritePass>();
+std::unique_ptr<OperationPass<ModuleOp>> createPatternMatchRewritePass() {
+  return std::make_unique<PatternMatchRewritePass>();
 }
 
 } // namespace mlir::triton::CVSplit

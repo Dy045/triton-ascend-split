@@ -35,19 +35,24 @@
 namespace mlir {
 namespace triton {
 
-class PlanCubeBlockPass : public PassWrapper<PlanCubeBlockPass, OperationPass<ModuleOp>> {
-  public:
-    MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(PlanCubeBlockPass);
+class PlanCubeBlockPass
+    : public PassWrapper<PlanCubeBlockPass, OperationPass<ModuleOp>> {
+public:
+  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(PlanCubeBlockPass);
 
-    PlanCubeBlockPass() = default;
-    void runOnOperation() override;
+  PlanCubeBlockPass() = default;
+  void runOnOperation() override;
 
-    llvm::StringRef getArgument() const final { return "plan-cube-block"; }
+  llvm::StringRef getArgument() const final { return "plan-cube-block"; }
 
-  private:
-    SmallVector<Operation *> matchSeed(Operation *dotOp, CVPipeline::ComputeBlockIdManager &bm, const CVPipeline::MemoryDependenceGraph &memGraph);
-    llvm::LogicalResult processBlockWithCubeBFS(Block *block, const CVPipeline::MemoryDependenceGraph &memGraph,
-                                                CVPipeline::ComputeBlockIdManager &bm);
+private:
+  SmallVector<Operation *>
+  matchSeed(Operation *dotOp, CVPipeline::ComputeBlockIdManager &bm,
+            const CVPipeline::MemoryDependenceGraph &memGraph);
+  llvm::LogicalResult
+  processBlockWithCubeBFS(Block *block,
+                          const CVPipeline::MemoryDependenceGraph &memGraph,
+                          CVPipeline::ComputeBlockIdManager &bm);
 };
 
 std::unique_ptr<OperationPass<ModuleOp>> createPlanCubeBlockPass();

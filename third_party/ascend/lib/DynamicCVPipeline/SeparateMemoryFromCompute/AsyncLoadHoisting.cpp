@@ -225,9 +225,9 @@ static void collectAddressGenerationOps(Operation *op, int64_t expectedBlockId,
     }
 
     if (visited.insert(defOp).second) {
-    chain.push_back(defOp);
-    collectAddressGenerationOps(defOp, expectedBlockId, visited, chain);
-  }
+      chain.push_back(defOp);
+      collectAddressGenerationOps(defOp, expectedBlockId, visited, chain);
+    }
   }
 }
 // Returns full chain and filtered chain (only ops with same block_id)

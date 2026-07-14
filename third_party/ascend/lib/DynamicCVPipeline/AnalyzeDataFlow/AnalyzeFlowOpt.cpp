@@ -21,24 +21,24 @@
  */
 
 #include "ascend/include/DynamicCVPipeline/AnalyzeDataFlow.h"
-#include "ascend/include/DynamicCVPipeline/Common/Utils.h"
 #include "ascend/include/DynamicCVPipeline/Common/BufferCountManager.h"
+#include "ascend/include/DynamicCVPipeline/Common/Utils.h"
+#include "bishengir/Dialect/HIVM/IR/HIVM.h"
+#include "bishengir/Dialect/Scope/IR/Scope.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/Builders.h"
-#include "bishengir/Dialect/Scope/IR/Scope.h"
-#include "bishengir/Dialect/HIVM/IR/HIVM.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/Support/Debug.h"
 
 static constexpr const char *DEBUG_TYPE = "analyze-flow-opt";
 #define DBGS() (llvm::dbgs() << '[' << DEBUG_TYPE << "] ")
-#define LDBG(...)                    \
-    LLVM_DEBUG({                     \
-        DBGS();                      \
-        llvm::dbgs() << __VA_ARGS__; \
-        llvm::dbgs() << "\n";        \
-    })
+#define LDBG(...)                                                              \
+  LLVM_DEBUG({                                                                 \
+    DBGS();                                                                    \
+    llvm::dbgs() << __VA_ARGS__;                                               \
+    llvm::dbgs() << "\n";                                                      \
+  })
 
 using namespace mlir;
 using namespace triton;
@@ -55,65 +55,66 @@ static bool g_enableFlowOptimization = false;
 namespace {
 
 // Check if scopeOp has CUBE tcore_type
-static bool isCubeScope(scope::ScopeOp scopeOp)
-{
-    auto coreTypeAttr = scopeOp->getAttrOfType<hivm::TCoreTypeAttr>(hivm::TCoreTypeAttr::name);
-    if (!coreTypeAttr) {
-        return false;
-    }
-    return coreTypeAttr.getTcoretype() == hivm::TCoreType::CUBE;
+static bool isCubeScope(scope::ScopeOp scopeOp) {
+  auto coreTypeAttr =
+      scopeOp->getAttrOfType<hivm::TCoreTypeAttr>(hivm::TCoreTypeAttr::name);
+  if (!coreTypeAttr) {
+    return false;
+  }
+  return coreTypeAttr.getTcoretype() == hivm::TCoreType::CUBE;
 }
 
 // Add flowOpt attribute to main_loop forOps inside CUBE scope
-static void addFlowOptAttrToMainLoop(ModuleOp module)
-{
-    module.walk([&](scope::ScopeOp scopeOp) {
-        // Check if this scope is CUBE
-        if (!isCubeScope(scopeOp)) {
-            return;
-        }
-        
-        LDBG("[INFO]: Found CUBE scope, adding flowOpt attribute to main_loop forOps inside");
-        
-        // Walk inside the scope to find main_loop forOps
-        scopeOp.walk([&](scf::ForOp forOp) {
-            if (forOp->hasAttr(CVPipeline::kMainLoop)) {
-                LDBG("[INFO]: Adding flowOpt attribute to main_loop forOp in CUBE scope");
-                forOp->setAttr(CVPipeline::kFlowOpt, Builder(module.getContext()).getUnitAttr());
-            }
-        });
+static void addFlowOptAttrToMainLoop(ModuleOp module) {
+  module.walk([&](scope::ScopeOp scopeOp) {
+    // Check if this scope is CUBE
+    if (!isCubeScope(scopeOp)) {
+      return;
+    }
+
+    LDBG("[INFO]: Found CUBE scope, adding flowOpt attribute to main_loop "
+         "forOps inside");
+
+    // Walk inside the scope to find main_loop forOps
+    scopeOp.walk([&](scf::ForOp forOp) {
+      if (forOp->hasAttr(CVPipeline::kMainLoop)) {
+        LDBG("[INFO]: Adding flowOpt attribute to main_loop forOp in CUBE "
+             "scope");
+        forOp->setAttr(CVPipeline::kFlowOpt,
+                       Builder(module.getContext()).getUnitAttr());
+      }
     });
+  });
 }
 
 } // namespace
 
-void AnalyzeFlowOptPass::runOnOperation()
-{
-    ModuleOp module = getOperation();
+void AnalyzeFlowOptPass::runOnOperation() {
+  ModuleOp module = getOperation();
 
-    if (g_enableFlowOptimization) {
-        LDBG("[INFO]: Flow optimization is enabled!");
-        LDBG("Before AnalyzeFlowOpt:\n" << module << "\n");
-        addFlowOptAttrToMainLoop(module);
-        LDBG("After AnalyzeFlowOpt:\n" << module << "\n");
-    }
+  if (g_enableFlowOptimization) {
+    LDBG("[INFO]: Flow optimization is enabled!");
+    LDBG("Before AnalyzeFlowOpt:\n" << module << "\n");
+    addFlowOptAttrToMainLoop(module);
+    LDBG("After AnalyzeFlowOpt:\n" << module << "\n");
+  }
 }
 
 namespace mlir {
 namespace triton {
 
 // Set the global flag for flow optimization
-void setEnableDynamicFlowOptimization(bool enable)
-{
-    g_enableFlowOptimization = enable;
-    LLVM_DEBUG({
-        llvm::dbgs() << "[analyze-flow-opt] [INFO]: setEnableDynamicFlowOptimization called with value: " << enable << "\n";
-    });
+void setEnableDynamicFlowOptimization(bool enable) {
+  g_enableFlowOptimization = enable;
+  LLVM_DEBUG({
+    llvm::dbgs() << "[analyze-flow-opt] [INFO]: "
+                    "setEnableDynamicFlowOptimization called with value: "
+                 << enable << "\n";
+  });
 }
 
-std::unique_ptr<OperationPass<ModuleOp>> createAnalyzeFlowOptPass()
-{
-    return std::make_unique<AnalyzeFlowOptPass>();
+std::unique_ptr<OperationPass<ModuleOp>> createAnalyzeFlowOptPass() {
+  return std::make_unique<AnalyzeFlowOptPass>();
 }
 
 } // namespace triton

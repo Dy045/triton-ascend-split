@@ -48,7 +48,5 @@ module attributes {hacc.target = #hacc.target<"Ascend950PR_9579">} {
 // CHECK: } else {
 // CHECK: scf.yield {Undefined, ssbuffer.block_id = 5 : i32, ssbuffer.core_type = "VECTOR, VECTOR"} %[[EXP_5]], %[[TENSOR_10]] : tensor<128x128xf32>, tensor<128x128xf32>
 // CHECK: } {DataUse, ssbuffer.block_id = 6 : i32, ssbuffer.core_type = "VECTOR, VECTOR"}
-// CHECK: arith.mulf %[[IF_11]]#0, %[[IF_11]]#1 
+// CHECK: arith.mulf %[[IF_11]]#0, %[[IF_11]]#1
 // CHECK: return
-
-

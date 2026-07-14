@@ -60,7 +60,7 @@ module {
     %c0 = arith.constant 0 : index
     %c1 = arith.constant 1 : index
     %c10 = arith.constant 10 : index
-    
+
     %result = scf.for %iv = %c0 to %c10 step %c1 iter_args(%memref = %arg0) -> (memref<128x64xf16>) {
       // CHECK: linalg.matmul {ssbuffer.block_id = 31 : i32, ssbuffer.core_type = "CUBE"}
       %matmul = linalg.matmul {ssbuffer.block_id = 31 : i32, ssbuffer.core_type = "CUBE"} ins(%A, %B : tensor<64x64xf16>, tensor<64x64xf16>) outs(%init : tensor<64x64xf32>) -> tensor<64x64xf32>
@@ -72,10 +72,10 @@ module {
       %subview = memref.subview %memref[0, 0] [64, 64] [1, 1] {ssbuffer.block_id = 34 : i32, ssbuffer.core_type = "VECTOR"} : memref<128x64xf16> to memref<64x64xf16, strided<[64, 1]>>
       // CHECK: bufferization.materialize_in_destination %{{.*}} {ssbuffer.block_id = 35 : i32, ssbuffer.core_type = "VECTOR"}
       bufferization.materialize_in_destination %extract in writable %subview {ssbuffer.block_id = 35 : i32, ssbuffer.core_type = "VECTOR"} : (tensor<64x64xf16>, memref<64x64xf16, strided<[64, 1]>>) -> ()
-      
+
       scf.yield %memref : memref<128x64xf16>
     }
-    
+
     return
   }
 

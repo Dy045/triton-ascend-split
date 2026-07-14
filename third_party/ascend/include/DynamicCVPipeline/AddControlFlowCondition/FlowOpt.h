@@ -38,23 +38,25 @@ namespace triton {
 
 class FlowOptPass : public PassWrapper<FlowOptPass, OperationPass<ModuleOp>> {
 public:
-    FlowOptPass() = default;
+  FlowOptPass() = default;
 
-    void runOnOperation() override;
+  void runOnOperation() override;
 
-    void setConditionInfo(ControlFlowConditionInfo *info) { this->info = info; }
+  void setConditionInfo(ControlFlowConditionInfo *info) { this->info = info; }
 
-    llvm::StringRef getArgument() const override { return "flow-opt"; }
+  llvm::StringRef getArgument() const override { return "flow-opt"; }
 
 private:
-    // Create new IfOp with updated condition
-    scf::IfOp createNewIfOpWithFlowOptCondition(scf::IfOp oldIfOp, Value newCondition);
+  // Create new IfOp with updated condition
+  scf::IfOp createNewIfOpWithFlowOptCondition(scf::IfOp oldIfOp,
+                                              Value newCondition);
 
-    // Build the flow optimization condition
-    Value buildFlowOptCondition(OpBuilder &builder, Location loc, scf::IfOp firstIfOp, 
-                                scf::ForOp forOp, Value originalCondition);
+  // Build the flow optimization condition
+  Value buildFlowOptCondition(OpBuilder &builder, Location loc,
+                              scf::IfOp firstIfOp, scf::ForOp forOp,
+                              Value originalCondition);
 
-    ControlFlowConditionInfo *info = nullptr;
+  ControlFlowConditionInfo *info = nullptr;
 };
 
 std::unique_ptr<OperationPass<ModuleOp>> createFlowOptPass();

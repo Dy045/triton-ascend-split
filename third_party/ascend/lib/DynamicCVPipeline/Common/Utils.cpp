@@ -19,119 +19,110 @@ namespace CVPipeline {
 
 static bool g_enableCubeBlockMerge = true;
 
-void setEnableCubeBlockMerge(bool enable)
-{
-    g_enableCubeBlockMerge = enable;
-}
+void setEnableCubeBlockMerge(bool enable) { g_enableCubeBlockMerge = enable; }
 
-bool isCubeBlockMergeEnabled()
-{
-    return g_enableCubeBlockMerge;
-}
+bool isCubeBlockMergeEnabled() { return g_enableCubeBlockMerge; }
 
-CoreType getOpCoreType(Operation *op)
-{
-    if (!op) {
-        return CoreType::UNDETERMINED;
-    }
-    if (auto a = op->getAttrOfType<StringAttr>(kCoreType)) {
-        return fromStrCoreType(a.getValue());
-    }
+CoreType getOpCoreType(Operation *op) {
+  if (!op) {
     return CoreType::UNDETERMINED;
+  }
+  if (auto a = op->getAttrOfType<StringAttr>(kCoreType)) {
+    return fromStrCoreType(a.getValue());
+  }
+  return CoreType::UNDETERMINED;
 }
 
-llvm::LogicalResult verifyOpBlockId(Operation *op)
-{
-    if (!op) {
-        return llvm::failure();
+llvm::LogicalResult verifyOpBlockId(Operation *op) {
+  if (!op) {
+    return llvm::failure();
+  }
+
+  auto blockId = op->getAttrOfType<IntegerAttr>(kBlockId);
+  if (blockId && blockId.getInt() < 0) {
+    std::string_view errorPass = "previous passes";
+    auto diag = op->emitError()
+                << "block id should not be negative! Please report to ";
+    switch (getOpCoreType(op)) {
+    case CoreType::CUBE_ONLY:
+      diag << "PlanCubePass";
+      break;
+    case CoreType::VECTOR_ONLY:
+      diag << "PlanVectorPass";
+      break;
+    default:
+      diag << "previous passes";
     }
+    return llvm::failure();
+  }
 
-    auto blockId = op->getAttrOfType<IntegerAttr>(kBlockId);
-    if (blockId && blockId.getInt() < 0) {
-        std::string_view errorPass = "previous passes";
-        auto diag = op->emitError() << "block id should not be negative! Please report to ";
-        switch (getOpCoreType(op)) {
-            case CoreType::CUBE_ONLY:
-                diag << "PlanCubePass";
-                break;
-            case CoreType::VECTOR_ONLY:
-                diag << "PlanVectorPass";
-                break;
-            default:
-                diag << "previous passes";
-        }
-        return llvm::failure();
+  return llvm::success();
+}
+
+std::optional<int> getOpBlockId(Operation *op) {
+  if (!op) {
+    return std::nullopt;
+  }
+  auto blockIdAttr = op->getAttrOfType<IntegerAttr>(kBlockId);
+  if (!blockIdAttr) {
+    return std::nullopt;
+  }
+
+  return blockIdAttr.getInt();
+}
+
+int getAvailableBlockId(ModuleOp module) {
+  int maxBlockId = -1;
+  module.walk([&](Operation *op) {
+    auto blockIdOpt = getOpBlockId(op);
+    if (blockIdOpt) {
+      int currentId = *blockIdOpt;
+      if (currentId > maxBlockId) {
+        maxBlockId = currentId;
+      }
     }
-
-    return llvm::success();
+  });
+  return maxBlockId + 1;
 }
 
-std::optional<int> getOpBlockId(Operation *op)
-{
-    if (!op) {
-        return std::nullopt;
-    }
-    auto blockIdAttr = op->getAttrOfType<IntegerAttr>(kBlockId);
-    if (!blockIdAttr) {
-        return std::nullopt;
-    }
-
-    return blockIdAttr.getInt();
+void setFallbackAttr(ModuleOp module) {
+  OpBuilder builder(module.getContext());
+  module->setAttr(CVPipeline::ERRCODE_ATTR,
+                  builder.getI32IntegerAttr(CVPipeline::ERRCODE_IGNORED));
 }
 
-int getAvailableBlockId(ModuleOp module)
-{
-    int maxBlockId = -1;
-    module.walk([&](Operation *op) {
-        auto blockIdOpt = getOpBlockId(op);
-        if (blockIdOpt) {
-            int currentId = *blockIdOpt;
-            if (currentId > maxBlockId) {
-                maxBlockId = currentId;
-            }
-        }
-    });
-    return maxBlockId + 1;
+bool isVectorOnlyOp(Operation *op) {
+  if (!op) {
+    return false;
+  }
+
+  return llvm::TypeSwitch<Operation *, bool>(op)
+      .Case([](linalg::ReduceOp) { return true; })
+      .Case<arith::SelectOp, math::FloorOp>([](Operation *op) {
+        return isa<RankedTensorType>(op->getResult(0).getType());
+      })
+      .Default([](auto) { return false; });
 }
 
-void setFallbackAttr(ModuleOp module)
-{
-    OpBuilder builder(module.getContext());
-    module->setAttr(CVPipeline::ERRCODE_ATTR, builder.getI32IntegerAttr(CVPipeline::ERRCODE_IGNORED));
-}
-
-bool isVectorOnlyOp(Operation *op)
-{
-    if (!op) {
-        return false;
-    }
-
-    return llvm::TypeSwitch<Operation *, bool>(op)
-        .Case([](linalg::ReduceOp) { return true; })
-        .Case<arith::SelectOp, math::FloorOp>(
-            [](Operation *op) { return isa<RankedTensorType>(op->getResult(0).getType()); })
-        .Default([](auto) { return false; });
-}
-
-bool isScfOp(Operation *op)
-{
+bool isScfOp(Operation *op) {
   return llvm::isa<scf::SCFDialect>(op->getDialect());
 }
 
 // Check nextOp is only user of preOp
-bool isOnlyDirectlyUse(Operation *preOp, Operation *nextOp, const CVPipeline::MemoryDependenceGraph &memGraph) {
-    if (!preOp || !nextOp) {
-        return false;
-    }
-    SmallVector<Operation *> allusers;
-    allusers.append(preOp->getUsers().begin(), preOp->getUsers().end());
-    for (auto memUser : memGraph.getExecAfter(preOp)) {
-        allusers.push_back(memUser);
-    }
-    if (allusers.size() != 1) {
-        return false;
-    }
-    return (*allusers.begin()) == nextOp;
+bool isOnlyDirectlyUse(Operation *preOp, Operation *nextOp,
+                       const CVPipeline::MemoryDependenceGraph &memGraph) {
+  if (!preOp || !nextOp) {
+    return false;
+  }
+  SmallVector<Operation *> allusers;
+  allusers.append(preOp->getUsers().begin(), preOp->getUsers().end());
+  for (auto memUser : memGraph.getExecAfter(preOp)) {
+    allusers.push_back(memUser);
+  }
+  if (allusers.size() != 1) {
+    return false;
+  }
+  return (*allusers.begin()) == nextOp;
 }
 
 } // namespace CVPipeline

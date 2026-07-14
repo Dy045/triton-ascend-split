@@ -36,6 +36,8 @@
 
 #include "ascend/include/DynamicCVPipeline/Common/MemoryEffectsTracker.h"
 #include "ascend/include/DynamicCVPipeline/Common/Utils.h"
+#include "bishengir/Dialect/Annotation/IR/Annotation.h"
+#include "mlir/Dialect/Bufferization/IR/Bufferization.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/IR/Block.h"
@@ -45,533 +47,532 @@
 #include "mlir/IR/Region.h"
 #include "mlir/Interfaces/SideEffectInterfaces.h"
 #include "mlir/Interfaces/ViewLikeInterface.h"
-#include "mlir/Dialect/Bufferization/IR/Bufferization.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SetVector.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/Support/Debug.h"
-#include "bishengir/Dialect/Annotation/IR/Annotation.h"
 
 using namespace mlir;
 static constexpr const char *DEBUG_TYPE = "memory-effects-tracker";
-#define LOG_DEBUG(...) LLVM_DEBUG(llvm::dbgs() << " [" << DEBUG_TYPE << "] " << __VA_ARGS__)
+#define LOG_DEBUG(...)                                                         \
+  LLVM_DEBUG(llvm::dbgs() << " [" << DEBUG_TYPE << "] " << __VA_ARGS__)
 
 using namespace mlir::CVPipeline;
 
 namespace {
 
-bool isDefinedInside(Value v, Operation *op)
-{
-    if (!v || !op) {
-        return false;
-    }
+bool isDefinedInside(Value v, Operation *op) {
+  if (!v || !op) {
+    return false;
+  }
 
-    if (auto arg = dyn_cast<BlockArgument>(v)) {
-        Operation *parent = arg.getOwner()->getParentOp();
-        return parent && op->isAncestor(parent);
-    }
+  if (auto arg = dyn_cast<BlockArgument>(v)) {
+    Operation *parent = arg.getOwner()->getParentOp();
+    return parent && op->isAncestor(parent);
+  }
 
-    Operation *defOp = v.getDefiningOp();
-    if (!defOp) {
-        return false;
-    }
+  Operation *defOp = v.getDefiningOp();
+  if (!defOp) {
+    return false;
+  }
 
-    return op->isProperAncestor(defOp);
+  return op->isProperAncestor(defOp);
 }
 
-Value getViewSource(Value val)
-{
-    while (auto viewLike = val.getDefiningOp<ViewLikeOpInterface>()) {
-        val = viewLike.getViewSource();
-    }
-    return val;
+Value getViewSource(Value val) {
+  while (auto viewLike = val.getDefiningOp<ViewLikeOpInterface>()) {
+    val = viewLike.getViewSource();
+  }
+  return val;
 }
 
-MemoryEffects::EffectInstance remapEffectValue(const MemoryEffects::EffectInstance &effect, Value value)
-{
-    if (auto result = dyn_cast<OpResult>(value)) {
-        return MemoryEffects::EffectInstance(effect.getEffect(), result, effect.getParameters(), effect.getStage(),
-                                             effect.getEffectOnFullRegion(), effect.getResource());
-    }
+MemoryEffects::EffectInstance
+remapEffectValue(const MemoryEffects::EffectInstance &effect, Value value) {
+  if (auto result = dyn_cast<OpResult>(value)) {
+    return MemoryEffects::EffectInstance(
+        effect.getEffect(), result, effect.getParameters(), effect.getStage(),
+        effect.getEffectOnFullRegion(), effect.getResource());
+  }
 
-    return MemoryEffects::EffectInstance(effect.getEffect(), cast<BlockArgument>(value), effect.getParameters(),
-                                         effect.getStage(), effect.getEffectOnFullRegion(), effect.getResource());
+  return MemoryEffects::EffectInstance(
+      effect.getEffect(), cast<BlockArgument>(value), effect.getParameters(),
+      effect.getStage(), effect.getEffectOnFullRegion(), effect.getResource());
 }
 
-bool isKnownNoMemoryEffectCall(Operation *op)
-{
-    auto callOp = dyn_cast<func::CallOp>(op);
-    return callOp && callOp.getCallee().starts_with("triton_indirect_load");
+bool isKnownNoMemoryEffectCall(Operation *op) {
+  auto callOp = dyn_cast<func::CallOp>(op);
+  return callOp && callOp.getCallee().starts_with("triton_indirect_load");
 }
 
-bool shouldAnalyzeAsLeaf(Operation *op)
-{
-    return op->getNumRegions() == 0 || isa<linalg::LinalgOp>(op);
+bool shouldAnalyzeAsLeaf(Operation *op) {
+  return op->getNumRegions() == 0 || isa<linalg::LinalgOp>(op);
 }
 
-void collectLeafOps(Operation *op, SmallVectorImpl<Operation *> &leafOps)
-{
-    if (shouldAnalyzeAsLeaf(op)) {
-        leafOps.push_back(op);
-        return;
-    }
+void collectLeafOps(Operation *op, SmallVectorImpl<Operation *> &leafOps) {
+  if (shouldAnalyzeAsLeaf(op)) {
+    leafOps.push_back(op);
+    return;
+  }
 
-    for (Region &region : op->getRegions()) {
-        for (Block &block : region) {
-            for (Operation &inner : block) {
-                collectLeafOps(&inner, leafOps);
-            }
-        }
+  for (Region &region : op->getRegions()) {
+    for (Block &block : region) {
+      for (Operation &inner : block) {
+        collectLeafOps(&inner, leafOps);
+      }
     }
+  }
 }
 
 } // namespace
 
-MemoryDependenceGraph::MemoryDependenceGraph(Operation *root, AliasAnalysis &aa) : root(root), aa(aa)
-{
-    if (!root) {
-        return;
+MemoryDependenceGraph::MemoryDependenceGraph(Operation *root, AliasAnalysis &aa)
+    : root(root), aa(aa) {
+  if (!root) {
+    return;
+  }
+  analyzeOp(root);
+  slots.clear();
+  valueToSlot.clear();
+}
+
+ArrayRef<Operation *> MemoryDependenceGraph::getMemDefs(Operation *op) const {
+  auto it = memDefs.find(op);
+  if (it == memDefs.end()) {
+    return {};
+  }
+  return it->second;
+}
+
+ArrayRef<Operation *> MemoryDependenceGraph::getMemUsers(Operation *op) const {
+  auto it = memUsers.find(op);
+  if (it == memUsers.end())
+    return {};
+  return it->second;
+}
+
+ArrayRef<Operation *>
+MemoryDependenceGraph::getExecBefore(Operation *op) const {
+  auto it = execBefore.find(op);
+  if (it == execBefore.end())
+    return {};
+  return it->second;
+}
+
+ArrayRef<Operation *> MemoryDependenceGraph::getExecAfter(Operation *op) const {
+  auto it = execAfter.find(op);
+  if (it == execAfter.end())
+    return {};
+  return it->second;
+}
+
+SmallVector<Operation *>
+MemoryDependenceGraph::getRealDependency(Operation *frontOp,
+                                         Operation *backOp) {
+  if (!frontOp || !backOp) {
+    return {};
+  }
+
+  SmallVector<Operation *> leafOps;
+  collectLeafOps(frontOp, leafOps);
+
+  bool unknown = false;
+  SmallVector<MemoryEffects::EffectInstance> backEffects =
+      collectOuterEffects(backOp, unknown, false);
+  bool backUnknown = unknown;
+
+  // Create slots for frontOps, using existing effects logic to process
+  slots.clear();
+  valueToSlot.clear();
+  llvm::SmallSetVector<Operation *, INIT_SIZE> dependencyOps;
+  for (Operation *leafOp : leafOps) {
+    auto effects = collectOuterEffects(leafOp, unknown, false);
+    if (unknown) {
+      if (!isKnownNoMemoryEffectCall(leafOp)) {
+        dependencyOps.insert(leafOp);
+      }
+      continue;
     }
-    analyzeOp(root);
-    slots.clear();
-    valueToSlot.clear();
-}
-
-ArrayRef<Operation *> MemoryDependenceGraph::getMemDefs(Operation *op) const
-{
-    auto it = memDefs.find(op);
-    if (it == memDefs.end()) {
-        return {};
+    for (const auto &effect : effects) {
+      if (Value v = effect.getValue()) {
+        getOrCreateSlot(getViewSource(v));
+      }
     }
-    return it->second;
+    applyEffects(leafOp, effects, unknown);
+  }
+
+  // Analyze denpendence from frontOps to backOp
+  SmallVector<Operation *> defs;
+  SmallVector<Operation *> preds;
+  collectPreds(backEffects, backUnknown, defs, preds);
+  dependencyOps.insert(preds.begin(), preds.end());
+  return {dependencyOps.begin(), dependencyOps.end()};
 }
 
-ArrayRef<Operation *> MemoryDependenceGraph::getMemUsers(Operation *op) const
-{
-    auto it = memUsers.find(op);
-    if (it == memUsers.end())
-        return {};
-    return it->second;
+void MemoryDependenceGraph::analyzeOp(Operation *op) {
+  if (!op) {
+    return;
+  }
+
+  // The graph root is treated as a pure container: we don't query its own
+  // effects against itself, only recurse into its regions.
+  if (op == root) {
+    analyzeRegionsOf(op);
+    return;
+  }
+
+  LOG_DEBUG("Analyzing op " << *op << "\n");
+  // Step 1: collect outside memory effects
+  bool unknown = false;
+  SmallVector<MemoryEffects::EffectInstance> effects =
+      collectOuterEffects(op, unknown);
+
+  // Step 2: collect defs(WAR) and preds(WAR, WAW, RAW) dependency.
+  SmallVector<Operation *> defs;
+  SmallVector<Operation *> preds;
+  collectPreds(effects, unknown, defs, preds);
+  LOG_DEBUG("Defs: \n");
+  for (auto def : defs) {
+    LOG_DEBUG(*def << "\n");
+  }
+  LOG_DEBUG("Preds: \n");
+  for (auto pred : preds) {
+    LOG_DEBUG(*pred << "\n");
+  }
+
+  // Step 3: extract edges from defs and preds to the graph.
+  recordEdges(op, defs, preds);
+
+  // Step 4: recursively search regions.
+  if (op->getNumRegions() > 0) {
+    analyzeRegionsOf(op);
+  }
+
+  // Step 5: store effects into slots.
+  applyEffects(op, effects, unknown);
 }
 
-ArrayRef<Operation *> MemoryDependenceGraph::getExecBefore(Operation *op) const
-{
-    auto it = execBefore.find(op);
-    if (it == execBefore.end())
-        return {};
-    return it->second;
-}
+void MemoryDependenceGraph::analyzeRegionsOf(Operation *op) {
+  // Whether to isolated slots.
+  // For example: scf.for should keeps slots; funOp should use new slots.
+  const bool isolated =
+      op != root && op->hasTrait<OpTrait::IsIsolatedFromAbove>();
 
-ArrayRef<Operation *> MemoryDependenceGraph::getExecAfter(Operation *op) const
-{
-    auto it = execAfter.find(op);
-    if (it == execAfter.end())
-        return {};
-    return it->second;
-}
-
-SmallVector<Operation *> MemoryDependenceGraph::getRealDependency(Operation *frontOp, Operation *backOp)
-{
-    if (!frontOp || !backOp) {
-        return {};
+  for (Region &region : op->getRegions()) {
+    // Snapshot is used for quickly restoration.
+    Snapshot snap = takeSnapshot();
+    if (isolated) {
+      slots.clear();
+      valueToSlot.clear();
     }
 
-    SmallVector<Operation *> leafOps;
-    collectLeafOps(frontOp, leafOps);
-
-    bool unknown = false;
-    SmallVector<MemoryEffects::EffectInstance> backEffects = collectOuterEffects(backOp, unknown, false);
-    bool backUnknown = unknown;
-
-    // Create slots for frontOps, using existing effects logic to process
-    slots.clear();
-    valueToSlot.clear();
-    llvm::SmallSetVector<Operation *, INIT_SIZE> dependencyOps;
-    for (Operation *leafOp : leafOps) {
-        auto effects = collectOuterEffects(leafOp, unknown, false);
-        if (unknown) {
-            if (!isKnownNoMemoryEffectCall(leafOp)) {
-                dependencyOps.insert(leafOp);
-            }
-            continue;
+    for (Block &block : region) {
+      for (BlockArgument arg : block.getArguments()) {
+        if (isa<BaseMemRefType>(arg.getType())) {
+          auto *slot = getOrCreateSlot(arg);
         }
-        for (const auto &effect : effects) {
-            if (Value v = effect.getValue()) {
-                getOrCreateSlot(getViewSource(v));
-            }
-        }
-        applyEffects(leafOp, effects, unknown);
+      }
+      for (Operation &inner : block) {
+        analyzeOp(&inner);
+      }
     }
 
-    // Analyze denpendence from frontOps to backOp
-    SmallVector<Operation *> defs;
-    SmallVector<Operation *> preds;
-    collectPreds(backEffects, backUnknown, defs, preds);
-    dependencyOps.insert(preds.begin(), preds.end());
-    return {dependencyOps.begin(), dependencyOps.end()};
+    restoreSnapshot(std::move(snap));
+  }
 }
 
-void MemoryDependenceGraph::analyzeOp(Operation *op)
-{
-    if (!op) {
-        return;
+SmallVector<MemoryEffects::EffectInstance>
+MemoryDependenceGraph::collectOuterEffects(Operation *op, bool &unknown,
+                                           bool recursive) {
+  unknown = false;
+
+  if (auto markOp = dyn_cast<annotation::MarkOp>(op)) {
+    if (markOp->hasAttr(CVPipeline::kInlinableQuantScaleAttr)) {
+      return {};
+    } else {
+      MemoryEffects::EffectInstance scopedWrite(MemoryEffects::Write::get());
+      return {remapEffectValue(scopedWrite, markOp.getSrc())};
+    }
+  }
+
+  if (auto allocTensorOp = dyn_cast<bufferization::AllocTensorOp>(op)) {
+    MemoryEffects::EffectInstance scopedAlloc(MemoryEffects::Allocate::get());
+    return {remapEffectValue(scopedAlloc, allocTensorOp.getResult())};
+  }
+
+  std::optional<SmallVector<MemoryEffects::EffectInstance>> raw;
+  if (recursive) {
+    raw = getEffectsRecursively(op);
+  } else if (auto effectInterface = dyn_cast<MemoryEffectOpInterface>(op)) {
+    raw.emplace();
+    effectInterface.getEffects(*raw);
+  }
+  if (!raw) {
+    if (!isKnownNoMemoryEffectCall(op)) {
+      unknown = true;
+    }
+    return {};
+  }
+
+  SmallVector<MemoryEffects::EffectInstance> filtered;
+  filtered.reserve(raw->size());
+  for (const auto &e : *raw) {
+    Value value = e.getValue();
+    if (!value) {
+      filtered.push_back(e);
+      continue;
     }
 
-    // The graph root is treated as a pure container: we don't query its own
-    // effects against itself, only recurse into its regions.
-    if (op == root) {
-        analyzeRegionsOf(op);
-        return;
+    Value source = getViewSource(value);
+    if (isDefinedInside(source, op)) {
+      continue;
     }
-
-    LOG_DEBUG("Analyzing op " << *op << "\n");
-    // Step 1: collect outside memory effects
-    bool unknown = false;
-    SmallVector<MemoryEffects::EffectInstance> effects = collectOuterEffects(op, unknown);
-
-    // Step 2: collect defs(WAR) and preds(WAR, WAW, RAW) dependency.
-    SmallVector<Operation *> defs;
-    SmallVector<Operation *> preds;
-    collectPreds(effects, unknown, defs, preds);
-    LOG_DEBUG("Defs: \n");
-    for (auto def: defs) {
-        LOG_DEBUG(*def << "\n");
-    }
-    LOG_DEBUG("Preds: \n");
-    for (auto pred: preds) {
-        LOG_DEBUG(*pred << "\n");
-    }
-
-    // Step 3: extract edges from defs and preds to the graph.
-    recordEdges(op, defs, preds);
-
-    // Step 4: recursively search regions.
-    if (op->getNumRegions() > 0) {
-        analyzeRegionsOf(op);
-    }
-
-    // Step 5: store effects into slots.
-    applyEffects(op, effects, unknown);
+    filtered.push_back(source == value ? e : remapEffectValue(e, source));
+  }
+  return filtered;
 }
 
-void MemoryDependenceGraph::analyzeRegionsOf(Operation *op)
-{
-    // Whether to isolated slots.
-    // For example: scf.for should keeps slots; funOp should use new slots.
-    const bool isolated = op != root && op->hasTrait<OpTrait::IsIsolatedFromAbove>();
-
-    for (Region &region : op->getRegions()) {
-        // Snapshot is used for quickly restoration.
-        Snapshot snap = takeSnapshot();
-        if (isolated) {
-            slots.clear();
-            valueToSlot.clear();
-        }
-
-        for (Block &block : region) {
-            for (BlockArgument arg : block.getArguments()) {
-                if (isa<BaseMemRefType>(arg.getType())) {
-                    auto *slot = getOrCreateSlot(arg);
-                }
-            }
-            for (Operation &inner : block) {
-                analyzeOp(&inner);
-            }
-        }
-
-        restoreSnapshot(std::move(snap));
-    }
+AliasResult MemoryDependenceGraph::queryAlias(Value lhs, Value rhs) {
+  auto isFuncEntryArg = [](const Value &val) -> bool {
+    auto arg = llvm::dyn_cast<BlockArgument>(val);
+    return arg && arg.getOwner()->isEntryBlock();
+  };
+  if (isFuncEntryArg(getViewSource(lhs)) &&
+      isFuncEntryArg(getViewSource(rhs))) {
+    return lhs == rhs ? AliasResult::MustAlias : AliasResult::NoAlias;
+  }
+  return aa.alias(lhs, rhs);
 }
 
-SmallVector<MemoryEffects::EffectInstance> MemoryDependenceGraph::collectOuterEffects(Operation *op, bool &unknown,
-                                                                                      bool recursive)
-{
-    unknown = false;
+SmallVector<MemoryDependenceGraph::MemSlot *>
+MemoryDependenceGraph::findAliasSlots(Value v) {
+  SmallVector<MemSlot *> result;
 
-    if (auto markOp = dyn_cast<annotation::MarkOp>(op)) {
-        if (markOp->hasAttr(CVPipeline::kInlinableQuantScaleAttr)) {
-            return {};
-        } else {
-            MemoryEffects::EffectInstance scopedWrite(MemoryEffects::Write::get());
-            return {remapEffectValue(scopedWrite, markOp.getSrc())};
-        }
-    }
-
-    if (auto allocTensorOp = dyn_cast<bufferization::AllocTensorOp>(op)) {
-        MemoryEffects::EffectInstance scopedAlloc(MemoryEffects::Allocate::get());
-        return {remapEffectValue(scopedAlloc, allocTensorOp.getResult())};
-    }
-
-    std::optional<SmallVector<MemoryEffects::EffectInstance>> raw;
-    if (recursive) {
-        raw = getEffectsRecursively(op);
-    } else if (auto effectInterface = dyn_cast<MemoryEffectOpInterface>(op)) {
-        raw.emplace();
-        effectInterface.getEffects(*raw);
-    }
-    if (!raw) {
-        if (!isKnownNoMemoryEffectCall(op)) {
-            unknown = true;
-        }
-        return {};
-    }
-
-    SmallVector<MemoryEffects::EffectInstance> filtered;
-    filtered.reserve(raw->size());
-    for (const auto &e : *raw) {
-        Value value = e.getValue();
-        if (!value) {
-            filtered.push_back(e);
-            continue;
-        }
-
-        Value source = getViewSource(value);
-        if (isDefinedInside(source, op)) {
-            continue;
-        }
-        filtered.push_back(source == value ? e : remapEffectValue(e, source));
-    }
-    return filtered;
-}
-
-AliasResult MemoryDependenceGraph::queryAlias(Value lhs, Value rhs)
-{
-    auto isFuncEntryArg = [] (const Value &val) -> bool {
-        auto arg = llvm::dyn_cast<BlockArgument>(val);
-        return arg && arg.getOwner()->isEntryBlock();
-    };
-    if (isFuncEntryArg(getViewSource(lhs)) && isFuncEntryArg(getViewSource(rhs))) {
-        return lhs == rhs ? AliasResult::MustAlias : AliasResult::NoAlias;
-    }
-    return aa.alias(lhs, rhs);
-}
-
-SmallVector<MemoryDependenceGraph::MemSlot *> MemoryDependenceGraph::findAliasSlots(Value v)
-{
-    SmallVector<MemSlot *> result;
-
-    if (!v) { // unknown location: conservatively alias with every slot
-        result.reserve(slots.size());
-        for (auto &slot : slots) {
-            result.push_back(slot.get());
-        }
-        return result;
-    }
-
-    SmallPtrSet<MemSlot *, INIT_SIZE> seen;
-
-    auto it = valueToSlot.find(v);
-    if (it != valueToSlot.end()) {
-        result.push_back(it->second);
-        seen.insert(it->second);
-    }
-
+  if (!v) { // unknown location: conservatively alias with every slot
+    result.reserve(slots.size());
     for (auto &slot : slots) {
-        MemSlot *raw = slot.get();
-        if (seen.contains(raw) || !raw->memref) {
-            continue;
-        }
-        auto aliasResult = queryAlias(raw->memref, v);
-        if (aliasResult != AliasResult::NoAlias) {
-            result.push_back(raw);
-            seen.insert(raw);
-        }
+      result.push_back(slot.get());
     }
-
     return result;
-}
+  }
 
-MemoryDependenceGraph::MemSlot *MemoryDependenceGraph::getOrCreateSlot(Value v)
-{
-    if (!v) {
-        return nullptr;
-    }
-    auto it = valueToSlot.find(v);
-    if (it != valueToSlot.end()) {
-        return it->second;
-    }
-    auto slot = std::make_unique<MemSlot>(v);
+  SmallPtrSet<MemSlot *, INIT_SIZE> seen;
+
+  auto it = valueToSlot.find(v);
+  if (it != valueToSlot.end()) {
+    result.push_back(it->second);
+    seen.insert(it->second);
+  }
+
+  for (auto &slot : slots) {
     MemSlot *raw = slot.get();
-    slots.push_back(std::move(slot));
-    valueToSlot[v] = raw;
-    return raw;
+    if (seen.contains(raw) || !raw->memref) {
+      continue;
+    }
+    auto aliasResult = queryAlias(raw->memref, v);
+    if (aliasResult != AliasResult::NoAlias) {
+      result.push_back(raw);
+      seen.insert(raw);
+    }
+  }
+
+  return result;
 }
 
-ArrayRef<MemoryDependenceGraph::MemSlot *> MemoryDependenceGraph::resolveAliasSlots(
-    Value v, DenseMap<Value, SmallVector<MemSlot *>> &cache)
-{
-    auto it = cache.find(v);
-    if (it != cache.end()) {
-        return it->second;
-    }
-    auto [ins, _] = cache.try_emplace(v, findAliasSlots(v));
-    return ins->second;
+MemoryDependenceGraph::MemSlot *
+MemoryDependenceGraph::getOrCreateSlot(Value v) {
+  if (!v) {
+    return nullptr;
+  }
+  auto it = valueToSlot.find(v);
+  if (it != valueToSlot.end()) {
+    return it->second;
+  }
+  auto slot = std::make_unique<MemSlot>(v);
+  MemSlot *raw = slot.get();
+  slots.push_back(std::move(slot));
+  valueToSlot[v] = raw;
+  return raw;
 }
 
-void MemoryDependenceGraph::collectPreds(ArrayRef<MemoryEffects::EffectInstance> effects, bool unknown,
-                                         SmallVectorImpl<Operation *> &defsOut,
-                                         SmallVectorImpl<Operation *> &predsOut)
-{
-    llvm::SmallSetVector<Operation *, INIT_SIZE> defs;
-    llvm::SmallSetVector<Operation *, INIT_SIZE> preds;
+ArrayRef<MemoryDependenceGraph::MemSlot *>
+MemoryDependenceGraph::resolveAliasSlots(
+    Value v, DenseMap<Value, SmallVector<MemSlot *>> &cache) {
+  auto it = cache.find(v);
+  if (it != cache.end()) {
+    return it->second;
+  }
+  auto [ins, _] = cache.try_emplace(v, findAliasSlots(v));
+  return ins->second;
+}
 
-    // defs collects lastWriter only on reads (RAW); preds collects all ordering deps (RAW/WAR/WAW).
-    auto addFromSlot = [&](MemSlot *slot, bool isWriteLike) {
-        if (slot->dataSource && !isWriteLike) {
-            defs.insert(slot->dataSource);
-        }
-        if (slot->lastWriter) {
-            preds.insert(slot->lastWriter); // XAW: we write/read what lastWriter wrote
-        }
-        if (isWriteLike) {
-            for (Operation *r : slot->pendingReads) {
-                preds.insert(r); // WAR: we will overwrite data still needed by readers
-            }
-        }
-    };
+void MemoryDependenceGraph::collectPreds(
+    ArrayRef<MemoryEffects::EffectInstance> effects, bool unknown,
+    SmallVectorImpl<Operation *> &defsOut,
+    SmallVectorImpl<Operation *> &predsOut) {
+  llvm::SmallSetVector<Operation *, INIT_SIZE> defs;
+  llvm::SmallSetVector<Operation *, INIT_SIZE> preds;
 
-    // The unknown op is considered as a barrier.
-    if (unknown) {
-        for (auto &slot : slots) {
-            addFromSlot(slot.get(), true);
-        }
-        predsOut.assign(preds.begin(), preds.end());
-        return;
+  // defs collects lastWriter only on reads (RAW); preds collects all ordering
+  // deps (RAW/WAR/WAW).
+  auto addFromSlot = [&](MemSlot *slot, bool isWriteLike) {
+    if (slot->dataSource && !isWriteLike) {
+      defs.insert(slot->dataSource);
     }
-
-    DenseMap<Value, SmallVector<MemSlot *>> cache;
-    for (const auto &e : effects) {
-        Value v = e.getValue();
-        if (isa<MemoryEffects::Read>(e.getEffect())) {
-            for (MemSlot *s : resolveAliasSlots(v, cache)) {
-                addFromSlot(s, false);
-            }
-        } else if (isa<MemoryEffects::Write>(e.getEffect()) || isa<MemoryEffects::Free>(e.getEffect())) {
-            for (MemSlot *s : resolveAliasSlots(v, cache)) {
-                addFromSlot(s, true);
-            }
-        }
+    if (slot->lastWriter) {
+      preds.insert(
+          slot->lastWriter); // XAW: we write/read what lastWriter wrote
     }
+    if (isWriteLike) {
+      for (Operation *r : slot->pendingReads) {
+        preds.insert(r); // WAR: we will overwrite data still needed by readers
+      }
+    }
+  };
 
-    defsOut.assign(defs.begin(), defs.end());
+  // The unknown op is considered as a barrier.
+  if (unknown) {
+    for (auto &slot : slots) {
+      addFromSlot(slot.get(), true);
+    }
     predsOut.assign(preds.begin(), preds.end());
+    return;
+  }
+
+  DenseMap<Value, SmallVector<MemSlot *>> cache;
+  for (const auto &e : effects) {
+    Value v = e.getValue();
+    if (isa<MemoryEffects::Read>(e.getEffect())) {
+      for (MemSlot *s : resolveAliasSlots(v, cache)) {
+        addFromSlot(s, false);
+      }
+    } else if (isa<MemoryEffects::Write>(e.getEffect()) ||
+               isa<MemoryEffects::Free>(e.getEffect())) {
+      for (MemSlot *s : resolveAliasSlots(v, cache)) {
+        addFromSlot(s, true);
+      }
+    }
+  }
+
+  defsOut.assign(defs.begin(), defs.end());
+  predsOut.assign(preds.begin(), preds.end());
 }
 
-void MemoryDependenceGraph::applyEffects(Operation *op, ArrayRef<MemoryEffects::EffectInstance> effects, bool unknown)
-{
-    // Conservative strategy. Unknown op is to treat as barrier.
-    if (unknown) {
+void MemoryDependenceGraph::applyEffects(
+    Operation *op, ArrayRef<MemoryEffects::EffectInstance> effects,
+    bool unknown) {
+  // Conservative strategy. Unknown op is to treat as barrier.
+  if (unknown) {
+    for (auto &slot : slots) {
+      slot->lastWriter = op;
+      slot->pendingReads.clear();
+    }
+    return;
+  }
+
+  for (auto result : op->getOpResults()) {
+    if (isa<BaseMemRefType>(result.getType())) {
+      if (MemSlot *s = getOrCreateSlot(result)) {
+        s->dataSource = op;
+        s->lastWriter = op;
+        s->pendingReads.clear();
+      }
+    }
+  }
+
+  DenseMap<Value, SmallVector<MemSlot *>> cache;
+
+  for (const auto &e : effects) {
+    // Reads first: prevents a self-aliasing op from clearing its own pending
+    // read.
+    if (isa<MemoryEffects::Read>(e.getEffect())) {
+      for (MemSlot *s : resolveAliasSlots(e.getValue(), cache)) {
+        s->pendingReads.insert(op);
+      }
+    }
+  }
+
+  for (const auto &e : effects) {
+    Value v = e.getValue();
+    if (isa<MemoryEffects::Allocate>(e.getEffect())) {
+      if (MemSlot *s = getOrCreateSlot(v)) {
+        s->dataSource = op;
+        s->lastWriter = op;
+        s->pendingReads.clear();
+      }
+    } else if (isa<MemoryEffects::Write>(e.getEffect())) {
+      for (MemSlot *s : resolveAliasSlots(v, cache)) {
+        // annotation::MarkOp, no data produced, is marked with Mem::Write
+        if (!isa<annotation::MarkOp>(op)) {
+          s->dataSource = op;
+        }
+        s->lastWriter = op;
+        s->pendingReads.clear();
+      }
+    } else if (isa<MemoryEffects::Free>(e.getEffect())) {
+      SmallPtrSet<MemSlot *, INIT_SIZE> toRemove;
+      if (!v) {
+        LOG_DEBUG("Free of unknown value: conservatively drop all slots.");
         for (auto &slot : slots) {
-            slot->lastWriter = op;
-            slot->pendingReads.clear();
+          toRemove.insert(slot.get());
         }
-        return;
-    }
-
-    for (auto result: op->getOpResults()) {
-        if (isa<BaseMemRefType>(result.getType())) {
-            if (MemSlot *s = getOrCreateSlot(result)) {
-                s->dataSource = op;
-                s->lastWriter = op;
-                s->pendingReads.clear();
-            }
+      } else {
+        auto aliasSlots = findAliasSlots(v);
+        for (auto *slot : aliasSlots) {
+          toRemove.insert(slot);
         }
-    }
-
-    DenseMap<Value, SmallVector<MemSlot *>> cache;
-
-    for (const auto &e : effects) {
-        // Reads first: prevents a self-aliasing op from clearing its own pending read.
-        if (isa<MemoryEffects::Read>(e.getEffect())) {
-            for (MemSlot *s : resolveAliasSlots(e.getValue(), cache)) {
-                s->pendingReads.insert(op);
-            }
+      }
+      llvm::erase_if(slots, [&](std::unique_ptr<MemSlot> &sp) {
+        if (toRemove.contains(sp.get())) {
+          if (sp->memref) {
+            valueToSlot.erase(sp->memref);
+          }
+          return true;
         }
+        return false;
+      });
+      cache.clear();
     }
-
-    for (const auto &e : effects) {
-        Value v = e.getValue();
-        if (isa<MemoryEffects::Allocate>(e.getEffect())) {
-            if (MemSlot *s = getOrCreateSlot(v)) {
-                s->dataSource = op;
-                s->lastWriter = op;
-                s->pendingReads.clear();
-            }
-        } else if (isa<MemoryEffects::Write>(e.getEffect())) {
-            for (MemSlot *s : resolveAliasSlots(v, cache)) {
-                // annotation::MarkOp, no data produced, is marked with Mem::Write
-                if (!isa<annotation::MarkOp>(op)) {
-                    s->dataSource = op;
-                }
-                s->lastWriter = op;
-                s->pendingReads.clear();
-            }
-        } else if (isa<MemoryEffects::Free>(e.getEffect())) {
-            SmallPtrSet<MemSlot *, INIT_SIZE> toRemove;
-            if (!v) {
-                LOG_DEBUG("Free of unknown value: conservatively drop all slots.");
-                for (auto &slot : slots) {
-                    toRemove.insert(slot.get());
-                }
-            } else {
-                auto aliasSlots = findAliasSlots(v);
-                for (auto *slot : aliasSlots) {
-                    toRemove.insert(slot);
-                }
-            }
-            llvm::erase_if(slots, [&](std::unique_ptr<MemSlot> &sp) {
-                if (toRemove.contains(sp.get())) {
-                    if (sp->memref) {
-                        valueToSlot.erase(sp->memref);
-                    }
-                    return true;
-                }
-                return false;
-            });
-            cache.clear();
-        }
-    }
+  }
 }
 
-MemoryDependenceGraph::Snapshot MemoryDependenceGraph::takeSnapshot() const
-{
-    Snapshot snap;
-    snap.states.reserve(slots.size());
-    for (const auto &slot : slots) {
-        snap.states.push_back(*slot);
-    }
-    return snap;
+MemoryDependenceGraph::Snapshot MemoryDependenceGraph::takeSnapshot() const {
+  Snapshot snap;
+  snap.states.reserve(slots.size());
+  for (const auto &slot : slots) {
+    snap.states.push_back(*slot);
+  }
+  return snap;
 }
 
-void MemoryDependenceGraph::restoreSnapshot(Snapshot &&snap)
-{
-    slots.clear();
-    valueToSlot.clear();
-    slots.reserve(snap.states.size());
-    for (auto &s : snap.states) {
-        auto slot = std::make_unique<MemSlot>(std::move(s));
-        if (slot->memref) {
-            valueToSlot[slot->memref] = slot.get();
-        }
-        slots.push_back(std::move(slot));
+void MemoryDependenceGraph::restoreSnapshot(Snapshot &&snap) {
+  slots.clear();
+  valueToSlot.clear();
+  slots.reserve(snap.states.size());
+  for (auto &s : snap.states) {
+    auto slot = std::make_unique<MemSlot>(std::move(s));
+    if (slot->memref) {
+      valueToSlot[slot->memref] = slot.get();
     }
+    slots.push_back(std::move(slot));
+  }
 }
 
-void MemoryDependenceGraph::recordEdges(Operation *op, ArrayRef<Operation *> defs, ArrayRef<Operation *> preds)
-{
-    if (!defs.empty()) {
-        auto &defList = memDefs[op];
-        defList.assign(defs.begin(), defs.end());
-        for (Operation *p : defs) {
-            memUsers[p].push_back(op);
-        }
+void MemoryDependenceGraph::recordEdges(Operation *op,
+                                        ArrayRef<Operation *> defs,
+                                        ArrayRef<Operation *> preds) {
+  if (!defs.empty()) {
+    auto &defList = memDefs[op];
+    defList.assign(defs.begin(), defs.end());
+    for (Operation *p : defs) {
+      memUsers[p].push_back(op);
     }
+  }
 
-    if (!preds.empty()) {
-        auto &execBeforeList = execBefore[op];
-        execBeforeList.assign(preds.begin(), preds.end());
-        for (Operation *p : preds) {
-            execAfter[p].push_back(op);
-        }
+  if (!preds.empty()) {
+    auto &execBeforeList = execBefore[op];
+    execBeforeList.assign(preds.begin(), preds.end());
+    for (Operation *p : preds) {
+      execAfter[p].push_back(op);
     }
+  }
 }

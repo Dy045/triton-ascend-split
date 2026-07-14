@@ -131,7 +131,8 @@ public:
 };
 
 // Pass for analyzing flow optimization
-class AnalyzeFlowOptPass : public PassWrapper<AnalyzeFlowOptPass, OperationPass<ModuleOp>> {
+class AnalyzeFlowOptPass
+    : public PassWrapper<AnalyzeFlowOptPass, OperationPass<ModuleOp>> {
 public:
   MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(AnalyzeFlowOptPass)
 

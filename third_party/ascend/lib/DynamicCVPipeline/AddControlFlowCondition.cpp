@@ -23,9 +23,9 @@
 #include "ascend/include/DynamicCVPipeline/AddControlFlowCondition.h"
 #include "ascend/include/DynamicCVPipeline/AddControlFlowCondition/CloneOps.h"
 #include "ascend/include/DynamicCVPipeline/AddControlFlowCondition/CreateIfOps.h"
-#include "ascend/include/DynamicCVPipeline/AddControlFlowCondition/InitDependentMap.h"
- #include "ascend/include/DynamicCVPipeline/AddControlFlowCondition/ProcessArgs.h"
 #include "ascend/include/DynamicCVPipeline/AddControlFlowCondition/FlowOpt.h"
+#include "ascend/include/DynamicCVPipeline/AddControlFlowCondition/InitDependentMap.h"
+#include "ascend/include/DynamicCVPipeline/AddControlFlowCondition/ProcessArgs.h"
 #include "ascend/include/DynamicCVPipeline/AddControlFlowCondition/UpdateConditionInfo.h"
 #include "ascend/include/DynamicCVPipeline/AddControlFlowCondition/UpdateForOps.h"
 #include "ascend/include/DynamicCVPipeline/AddControlFlowCondition/UpdateLoopIterTimes.h"
@@ -42,8 +42,7 @@ using namespace mlir;
 using namespace triton;
 
 // Check if the module should be skipped for control flow condition processing
-static LogicalResult verifyControlFlowPrerequisites(ModuleOp module)
-{
+static LogicalResult verifyControlFlowPrerequisites(ModuleOp module) {
   // Check if scopeOp has ssbuffer.skip
   bool hasSkipAttr = false;
   module.walk([&](Operation *op) {
@@ -63,8 +62,7 @@ static LogicalResult verifyControlFlowPrerequisites(ModuleOp module)
   return success();
 }
 
-void AddControlFlowConditionPass::runOnOperation()
-{
+void AddControlFlowConditionPass::runOnOperation() {
   ModuleOp module = getOperation();
 
   LDBG("Enter add controlflow condition pass.\n");
@@ -83,11 +81,13 @@ void AddControlFlowConditionPass::runOnOperation()
   pm.addPass(createCloneOpsPass());
 
   // Step1: Initialize crossCoreDependentMap and intraCoreDependentMap
-  std::unique_ptr<InitDependentMapPass> initDependentMapPass(new InitDependentMapPass());
+  std::unique_ptr<InitDependentMapPass> initDependentMapPass(
+      new InitDependentMapPass());
   initDependentMapPass->setConditionInfo(&info);
   pm.addPass(std::move(initDependentMapPass));
-  
-  // Step2: Process shared iter_args in for ops to eliminate arg sharing across block_ids
+
+  // Step2: Process shared iter_args in for ops to eliminate arg sharing across
+  // block_ids
   std::unique_ptr<ProcessArgsPass> processArgsPass(new ProcessArgsPass());
   processArgsPass->setConditionInfo(&info);
   pm.addPass(std::move(processArgsPass));
@@ -103,7 +103,8 @@ void AddControlFlowConditionPass::runOnOperation()
   updateForOpsPass->setConditionInfo(&info);
   pm.addPass(std::move(updateForOpsPass));
 
-  // Step5:Update the conditions of ifOp based on the intraCoreDependentMap and crossCoreDependentMap
+  // Step5:Update the conditions of ifOp based on the intraCoreDependentMap and
+  // crossCoreDependentMap
   auto updatePass = std::make_unique<UpdateConditionInfoPass>();
   updatePass->setConditionInfo(&info);
   pm.addPass(std::move(updatePass));
@@ -114,7 +115,8 @@ void AddControlFlowConditionPass::runOnOperation()
   pm.addPass(std::move(flowOptPass));
 
   // Step7: Update for loop iteration times based on intraCoreDependentMap
-  std::unique_ptr<UpdateLoopIterTimesPass> updateLoopIterTimesPass(new UpdateLoopIterTimesPass());
+  std::unique_ptr<UpdateLoopIterTimesPass> updateLoopIterTimesPass(
+      new UpdateLoopIterTimesPass());
   updateLoopIterTimesPass->setConditionInfo(&info);
   pm.addPass(std::move(updateLoopIterTimesPass));
 
@@ -129,19 +131,17 @@ void AddControlFlowConditionPass::runOnOperation()
 namespace mlir {
 namespace triton {
 
-std::unique_ptr<OperationPass<ModuleOp>> createAddControlFlowConditionPass()
-{
+std::unique_ptr<OperationPass<ModuleOp>> createAddControlFlowConditionPass() {
   return std::make_unique<AddControlFlowConditionPass>();
 }
 
-void registerAddControlFlowConditionPasses()
-{
-    registerPass(createCloneOpsPass);
-    registerPass(createCreateIfOpsPass);
-    registerPass(createProcessArgsPass);
-    registerPass(createUpdateForOpsPass);
-    registerPass(createFlowOptPass);
-    registerPass(createAddControlFlowConditionPass);
+void registerAddControlFlowConditionPasses() {
+  registerPass(createCloneOpsPass);
+  registerPass(createCreateIfOpsPass);
+  registerPass(createProcessArgsPass);
+  registerPass(createUpdateForOpsPass);
+  registerPass(createFlowOptPass);
+  registerPass(createAddControlFlowConditionPass);
 }
 } // namespace triton
 } // namespace mlir
