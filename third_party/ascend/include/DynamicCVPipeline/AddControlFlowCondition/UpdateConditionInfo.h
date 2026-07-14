@@ -169,17 +169,10 @@ private:
 
   int updateForOpYield(scf::ForOp forOp);
 
-<<<<<<< HEAD
-  int combineConditions(ModuleOp module, Value crossCoreCond,
-                        Value intraCoreCond, scf::IfOp ifOp, scf::ForOp forOp,
-                        size_t &usedCounterNum,
-                        DenseMap<Value, VarUpdateType> &varUpdateTypes);
-=======
   int combineConditions(ModuleOp module, Value crossCoreCond,
                         Value intraCoreCond, Value flowOptCond, scf::IfOp ifOp,
                         scf::ForOp forOp, size_t &usedCounterNum,
                         DenseMap<Value, VarUpdateType> &varUpdateTypes);
->>>>>>> 1a86432f6 ([ssbuffer](fix) Add applicable scenarios for FlowOpt (#977))
 
   int setCrossCoreCondition(
       SmallVector<int> crossCoreInputValues,

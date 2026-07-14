@@ -702,12 +702,12 @@ static LogicalResult splitMatmul(linalg::MatmulOp matmulOp,
             APFloat zeroAPFloat =
                 APFloat::getZero(floatType.getFloatSemantics());
             zeroValue = elseBuilder
-                            .create<arith::ConstantFloatOp>(
-                                elseLoc, zeroAPFloat, floatType)
+                            .create<arith::ConstantFloatOp>(elseLoc, floatType,
+                                                            zeroAPFloat)
                             .getResult();
           } else if (auto intType = dyn_cast<IntegerType>(elmType)) {
             zeroValue =
-                elseBuilder.create<arith::ConstantIntOp>(elseLoc, 0, intType)
+                elseBuilder.create<arith::ConstantIntOp>(elseLoc, intType, 0)
                     .getResult();
           }
           auto fillOp = elseBuilder.create<linalg::FillOp>(

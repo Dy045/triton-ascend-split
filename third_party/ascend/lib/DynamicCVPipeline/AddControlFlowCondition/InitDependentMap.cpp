@@ -29,17 +29,15 @@
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/Support/Debug.h"
-<<<<<<< HEAD
-=======
+
 #include "bishengir/Dialect/Annotation/IR/Annotation.h"
 #include "bishengir/Dialect/HIVM/IR/HIVM.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/BuiltinAttributes.h"
-    >>>>>>> 1a86432f6 ([ssbuffer](fix) Add applicable scenarios for FlowOpt (#977))
 
-    // Role in dependency attribute: ssbuffer.crossDeps/intraDeps = [groupId,
-    // roleId] role: 1=producer, 0=consumer
-    static const int producerId = 1;
+// Role in dependency attribute: ssbuffer.crossDeps/intraDeps = [groupId,
+// roleId] role: 1=producer, 0=consumer
+static const int producerId = 1;
 static const int consumerId = 0;
 static constexpr const char *DEBUG_TYPE = "InitDependentMap";
 #define DBGS() (llvm::dbgs() << '[' << DEBUG_TYPE << "] ")
@@ -478,9 +476,6 @@ static void printDependentMaps(ControlFlowConditionInfo *info) {
   }
 }
 
-<<<<<<< HEAD
-void InitDependentMapPass::runOnOperation() {
-=======
 // Find the IfOp that contains a given operation
 static scf::IfOp findIfOpContainingOp(Operation *op) {
   if (!op) {
@@ -799,7 +794,6 @@ static void printDAGInfo(ControlFlowConditionInfo *info) {
 }
 
 void InitDependentMapPass::runOnOperation() {
->>>>>>> 1a86432f6 ([ssbuffer](fix) Add applicable scenarios for FlowOpt (#977))
   ModuleOp module = getOperation();
 
   if (CVPipeline::hasFallbackAttr(module)) {

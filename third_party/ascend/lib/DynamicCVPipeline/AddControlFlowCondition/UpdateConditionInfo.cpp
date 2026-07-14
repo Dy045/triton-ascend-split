@@ -21,11 +21,8 @@
  */
 #include "third_party/ascend/include/DynamicCVPipeline/AddControlFlowCondition/UpdateConditionInfo.h"
 #include "ascend/include/DynamicCVPipeline/AddControlFlowCondition.h"
-<<<<<<< HEAD
-#include "ascend/include/DynamicCVPipeline/Common/Utils.h"
-    =======
 #include "ascend/include/DynamicCVPipeline/Common/BufferCountManager.h"
-    >>>>>>> 1a86432f6 ([ssbuffer](fix) Add applicable scenarios for FlowOpt (#977))
+#include "ascend/include/DynamicCVPipeline/Common/Utils.h"
 #include "bishengir/Dialect/HIVM/IR/HIVM.h"
 #include "bishengir/Dialect/HIVM/IR/HIVMImpl.h"
 #include "bishengir/Dialect/HIVM/IR/HIVMInterfaces.h"
@@ -38,7 +35,7 @@
 
 #include <string>
 
-    static constexpr const char *DEBUG_TYPE = "UpdateConditionInfoPass";
+static constexpr const char *DEBUG_TYPE = "UpdateConditionInfoPass";
 static constexpr const char *SSBUFFER_Main_LOOP = "ssbuffer.main_loop";
 static constexpr const char *SSBUFFER_IF = "ssbuffer.if";
 static constexpr int SSBUF_ADDR_SPACE = 11;
@@ -1591,21 +1588,12 @@ scf::IfOp UpdateConditionInfoPass::createNewIfOpWithBlocks(
   return newIfOp;
 }
 
-<<<<<<< HEAD
-// Combine the three conditions: crossCore condition + intraCore condition +
-// counter condition
-int UpdateConditionInfoPass::combineConditions(
-    ModuleOp module, Value crossCoreCond, Value intraCoreCond, scf::IfOp ifOp,
-    scf::ForOp forOp, size_t &usedCounterNum,
-    DenseMap<Value, VarUpdateType> &varUpdateTypes) {
-=======
 // Combine the conditions: crossCore condition + intraCore condition + counter
 // condition + flowOpt condition
 int UpdateConditionInfoPass::combineConditions(
     ModuleOp module, Value crossCoreCond, Value intraCoreCond,
     Value flowOptCond, scf::IfOp ifOp, scf::ForOp forOp, size_t &usedCounterNum,
     DenseMap<Value, VarUpdateType> &varUpdateTypes) {
->>>>>>> 1a86432f6 ([ssbuffer](fix) Add applicable scenarios for FlowOpt (#977))
   Location loc = ifOp.getLoc();
   SmallVector<Value> validConditions;
   Value counter;
@@ -1856,12 +1844,6 @@ int UpdateConditionInfoPass::updateIfConds(
           UPDATE_CONDITION_INFO_FAILED) {
         return UPDATE_CONDITION_INFO_FAILED;
       }
-<<<<<<< HEAD
-      // Step5:Combine the three conditions: crossCore condition + intraCore
-      // condition + counter condition
-      if (combineConditions(module, crossCoreCond, intraCoreCond, ifOp, forOp,
-                            usedCounterNum,
-=======
       // Step5:Set the flowOpt condition
       Value flowOptCond;
       if (setFlowOptCondition(ifOp, forOp, flowOptCond) ==
@@ -1872,7 +1854,6 @@ int UpdateConditionInfoPass::updateIfConds(
       // + counter condition + flowOpt condition
       if (combineConditions(module, crossCoreCond, intraCoreCond, flowOptCond,
                             ifOp, forOp, usedCounterNum,
->>>>>>> 1a86432f6 ([ssbuffer](fix) Add applicable scenarios for FlowOpt (#977))
                             varUpdateTypes) == UPDATE_CONDITION_INFO_FAILED) {
         return UPDATE_CONDITION_INFO_FAILED;
       }
