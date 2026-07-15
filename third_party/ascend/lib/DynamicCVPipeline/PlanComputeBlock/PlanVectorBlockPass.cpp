@@ -319,8 +319,134 @@ collectKeepOps(Block *block, SmallVector<Operation *> toProcess,
   return keepOps;
 }
 
+<<<<<<< HEAD
 static void evictAndRestoreState(
     Block *block, const SetVector<Operation *> &keepOps,
+=======
+static bool isTensorOperation(Operation *op) {
+  for (auto result : op->getResults()) {
+    if (isa<RankedTensorType>(result.getType())) {
+      return true;
+    }
+  }
+  for (auto operand : op->getOperands()) {
+    if (isa<RankedTensorType>(operand.getType())) {
+      return true;
+    }
+  }
+  return false;
+}
+
+static bool hasTensorOperation(const SmallVector<Operation *> &fuseGroup) {
+  for (auto op : fuseGroup) {
+    if (isTensorOperation(op)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+static void
+collectAllUsersInFuseGroup(Operation *op,
+                           const SmallVector<Operation *> &fuseGroup,
+                           SetVector<Operation *> &toRemove) {
+  if (toRemove.contains(op) || !llvm::is_contained(fuseGroup, op)) {
+    return;
+  }
+  toRemove.insert(op);
+  for (auto user : op->getUsers()) {
+    collectAllUsersInFuseGroup(user, fuseGroup, toRemove);
+  }
+}
+
+static void
+collectAllDependenciesInFuseGroup(Operation *op,
+                                  const SmallVector<Operation *> &fuseGroup,
+                                  SetVector<Operation *> &toRemove) {
+  if (toRemove.contains(op) || !llvm::is_contained(fuseGroup, op)) {
+    return;
+  }
+  toRemove.insert(op);
+  for (auto operand : op->getOperands()) {
+    if (auto definingOp = operand.getDefiningOp()) {
+      collectAllDependenciesInFuseGroup(definingOp, fuseGroup, toRemove);
+    }
+  }
+}
+
+static SmallVector<Operation *>
+extractToProcessFromFuseGroup(Block *block,
+                              const SmallVector<Operation *> &nowFuseGroup,
+                              ComputeBlockIdManager &bm) {
+  SmallVector<Operation *> toProcess(nowFuseGroup.begin(), nowFuseGroup.end());
+
+  if (!hasTensorOperation(nowFuseGroup)) {
+    LOG_DEBUG("no tensor operation in nowFuseGroup.....\n");
+    return toProcess;
+  }
+
+  SetVector<Operation *> toRemove;
+  auto forOp = dyn_cast<scf::ForOp>(block->getParentOp());
+  if (forOp) {
+    for (auto op : nowFuseGroup) {
+      for (auto operand : op->getOperands()) {
+        int argIdx = getLoopCarriedArgIndex(operand, block);
+        if (argIdx <= 0) {
+          continue;
+        }
+        auto *yieldOp = block->getTerminator();
+        auto yieldOperand = yieldOp->getOperand(argIdx - 1);
+        auto *defOp = yieldOperand.getDefiningOp();
+        if (defOp && bm.getBlockIdByOp(defOp) == -1 &&
+            !llvm::is_contained(nowFuseGroup, defOp)) {
+          collectAllUsersInFuseGroup(op, nowFuseGroup, toRemove);
+        }
+      }
+    }
+  }
+
+  for (auto op : nowFuseGroup) {
+    for (auto result : op->getResults()) {
+      if (auto tensorType = dyn_cast<mlir::TensorType>(result.getType())) {
+        mlir::Type elemType = tensorType.getElementType();
+        if (!elemType.isInteger(1)) {
+          continue;
+        }
+      }
+      bool hasExternalUser = false;
+      for (auto user : result.getUsers()) {
+        if (!llvm::is_contained(nowFuseGroup, user)) {
+          hasExternalUser = true;
+          break;
+        }
+      }
+      if (hasExternalUser) {
+        collectAllUsersInFuseGroup(op, nowFuseGroup, toRemove);
+        for (auto operand : op->getOperands()) {
+          if (auto definingOp = operand.getDefiningOp()) {
+            collectAllDependenciesInFuseGroup(definingOp, nowFuseGroup,
+                                              toRemove);
+          }
+        }
+      }
+    }
+  }
+  for (auto op : toRemove) {
+    LOG_DEBUG("Removing op when refining: " << *op << "\n");
+    toProcess.erase(std::remove(toProcess.begin(), toProcess.end(), op),
+                    toProcess.end());
+  }
+
+  if (!toProcess.empty() && !hasTensorOperation(toProcess)) {
+    LOG_DEBUG("no tensor operation in toProcess.....\n");
+    return {};
+  }
+  return toProcess;
+}
+
+static void evictAndRestoreState(
+    Block *block, const SetVector<Operation *> &keepOps,
+>>>>>>> 6b6cf3c22 ([ssbuffer](feat) enable_ub_refine_opt && insertionOptimization (#1037))
     SmallVector<Operation *> &fuseGroup, DenseMap<Operation *, bool> &visited,
     SmallVector<Operation *> &candidates, DenseMap<Operation *, int> &indegree,
     const CVPipeline::MemoryDependenceGraph &memGraph) {
@@ -368,6 +494,7 @@ static void evictAndRestoreState(
   }
 }
 
+<<<<<<< HEAD
 void refineFuseGroup(Block *block, SmallVector<Operation *> &nowFuseGroup,
                      DenseMap<Operation *, bool> &visited,
                      SmallVector<Operation *> &candidates,
@@ -379,28 +506,61 @@ void refineFuseGroup(Block *block, SmallVector<Operation *> &nowFuseGroup,
       findOpsAdjacentToCube(block, nowFuseGroup, visited, memGraph);
   // 2. early return: if cannot find one node which next node is CUBE, need to
   // check if return or not;
+=======
+void refineFuseGroup(Block *block, SmallVector<Operation *> &nowFuseGroup,
+                     DenseMap<Operation *, bool> &visited,
+                     SmallVector<Operation *> &candidates,
+                     DenseMap<Operation *, int> &indegree,
+                     const CVPipeline::MemoryDependenceGraph &memGraph,
+                     ComputeBlockIdManager &bm, bool isUBRefineOptEnabled) {
+  // 1.Find ops in fuse group whose next node is a non-fusable (CUBE-only) op
+  auto toProcess =
+      findOpsAdjacentToCube(block, nowFuseGroup, visited, memGraph);
+
+  // 2. If no cube adjacent op, extract toProcess from fuseGroup using fallback
+  // rules
+  if (toProcess.empty() && isUBRefineOptEnabled) {
+    LOG_DEBUG("No Cube adjacent op, extracting toProcess from fuseGroup.\n");
+    toProcess = extractToProcessFromFuseGroup(block, nowFuseGroup, bm);
+  }
+
+  // 3. If still empty after extraction, no op will be cut
+>>>>>>> 6b6cf3c22 ([ssbuffer](feat) enable_ub_refine_opt && insertionOptimization (#1037))
   if (toProcess.empty()) {
-    LOG_DEBUG("No Cube adjacent op, no op will be cut.");
+    LOG_DEBUG("No op will be cut after extraction.\n");
     findCandidates(indegree, candidates, visited, memGraph, bm);
     if (candidates.empty()) {
       return;
     }
   }
 
-  // 3. Collect keepOps transitively (data + memory + loop-carried deps)
+  // 4. Collect keepOps transitively (data + memory + loop-carried deps)
   auto keepOps = collectKeepOps(block, toProcess, nowFuseGroup, memGraph);
 
+<<<<<<< HEAD
   // 4. Remove non-kept ops from fuseGroup and restore BFS state
   evictAndRestoreState(block, keepOps, nowFuseGroup, visited, candidates,
                        indegree, memGraph);
+=======
+  // 5. Remove non-kept ops from fuseGroup and restore BFS state
+  evictAndRestoreState(block, keepOps, nowFuseGroup, visited, candidates,
+                       indegree, memGraph);
+>>>>>>> 6b6cf3c22 ([ssbuffer](feat) enable_ub_refine_opt && insertionOptimization (#1037))
   LOG_DEBUG("After cutting, kept " << keepOps.size() << "\n");
 }
 
 // Main function to plan vector block id for one block
+<<<<<<< HEAD
 llvm::LogicalResult
 planVectorBlockId(Block *block,
                   const CVPipeline::MemoryDependenceGraph &memGraph,
                   ComputeBlockIdManager &bm) {
+=======
+llvm::LogicalResult
+planVectorBlockId(Block *block,
+                  const CVPipeline::MemoryDependenceGraph &memGraph,
+                  ComputeBlockIdManager &bm, bool isUBRefineOptEnabled) {
+>>>>>>> 6b6cf3c22 ([ssbuffer](feat) enable_ub_refine_opt && insertionOptimization (#1037))
   // 1. topo initialize
   llvm::DenseMap<Operation *, int> indegree;
   llvm::SmallVector<Operation *> queue;
@@ -435,8 +595,13 @@ planVectorBlockId(Block *block,
       }
       // finish one group, assign block id and start next iteration
       // Cut error operations before assigning block id
+<<<<<<< HEAD
       refineFuseGroup(block, nowFuseGroup, visited, queue, indegree, memGraph,
                       bm);
+=======
+      refineFuseGroup(block, nowFuseGroup, visited, queue, indegree, memGraph,
+                      bm, isUBRefineOptEnabled);
+>>>>>>> 6b6cf3c22 ([ssbuffer](feat) enable_ub_refine_opt && insertionOptimization (#1037))
       LOG_DEBUG("Group after cutting: \n");
       for (auto op : nowFuseGroup) {
         LOG_DEBUG("fuseing: " << *op << "\n");
@@ -464,12 +629,27 @@ void PlanVectorBlockPass::runOnOperation() {
   auto &aa = getAnalysis<AliasAnalysis>();
   auto memDepGraph = MemoryDependenceGraph(moduleOp, aa);
   auto bm = ComputeBlockIdManager(moduleOp);
+  bool isUBRefineOptEnabled = false;
+  auto attr = moduleOp->getAttr(CVPipeline::kEnableUbRefineOpt);
+  if (attr) {
+    isUBRefineOptEnabled = true;
+  }
 
   // 2. search blocks in topo order and assign block id for each block
   llvm::SmallVector<Block *> blocks;
+<<<<<<< HEAD
   auto result = moduleOp.walk([&](Block *block) {
     if (llvm::failed(planVectorBlockId(block, memDepGraph, bm))) {
       return WalkResult::interrupt();
+=======
+  moduleOp.walk([&](Block *block) {
+    if (llvm::failed(
+            planVectorBlockId(block, memDepGraph, bm, isUBRefineOptEnabled))) {
+      moduleOp.emitError() << "[" << DEBUG_TYPE
+                           << "] Failed to plan vector block id for block";
+      signalPassFailure();
+      return;
+>>>>>>> 6b6cf3c22 ([ssbuffer](feat) enable_ub_refine_opt && insertionOptimization (#1037))
     }
     return WalkResult::advance();
   });
