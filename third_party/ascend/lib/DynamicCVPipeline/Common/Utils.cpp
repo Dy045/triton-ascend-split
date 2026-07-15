@@ -68,7 +68,7 @@ std::optional<int> getOpBlockId(Operation *op) {
     return std::nullopt;
   }
 
-  return static_cast<int>(blockIdAttr.getInt());
+  return blockIdAttr.getInt();
 }
 
 int getAvailableBlockId(ModuleOp module) {
@@ -76,7 +76,7 @@ int getAvailableBlockId(ModuleOp module) {
   module.walk([&](Operation *op) {
     auto blockIdOpt = getOpBlockId(op);
     if (blockIdOpt) {
-      int currentId = static_cast<int>(*blockIdOpt);
+      int currentId = *blockIdOpt;
       if (currentId > maxBlockId) {
         maxBlockId = currentId;
       }

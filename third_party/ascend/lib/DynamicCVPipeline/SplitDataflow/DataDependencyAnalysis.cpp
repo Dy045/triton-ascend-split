@@ -86,8 +86,7 @@ llvm::StringRef getCoreTypeWithIndex(Operation *op, int index) {
 bool DataDependencyAnalysisPass::isControlFlowOp(mlir::Operation *op) {
   if (!op)
     return false;
-  return isa<scf::ForOp>(op) || isa<scf::IfOp>(op) || isa<scf::WhileOp>(op) ||
-         isa<scf::YieldOp>(op);
+  return isa<scf::ForOp>(op) || isa<scf::IfOp>(op) || isa<scf::YieldOp>(op);
 }
 
 bool DataDependencyAnalysisPass::isCubeOrVectorOp(mlir::Operation *op) {
@@ -215,7 +214,7 @@ void DataDependencyAnalysisPass::createBlockInfoMap(DataDependencyInfo &info) {
   module.walk([&](mlir::Operation *op) {
     auto opBlockIdOpt = CVPipeline::getOpBlockId(op);
     if (opBlockIdOpt) {
-      int opBlockId = static_cast<int>(*opBlockIdOpt);
+      int opBlockId = *opBlockIdOpt;
       // When the id changes, the block ends && Exclude the initial state
       if (opBlockId != currentId && currentId != startCurrId) {
         collectBlockInfo(info, currentId, currentOps);
@@ -316,7 +315,7 @@ void DataDependencyAnalysisPass::insertProducerAndRecordDeps(
       LOG_DEBUG("Warning: User block ID not found for iterArg user.\n");
       continue;
     }
-    int userBlockId = static_cast<int>(*userBlockIdOpt);
+    int userBlockId = *userBlockIdOpt;
 
     // Determine dependency type based on initCoreType
     DependencyType depType;
@@ -503,7 +502,7 @@ void DataDependencyAnalysisPass::analyzeExternalInputs(
               "Warning: [v->c] Producer block ID not found for input value.\n");
           continue;
         }
-        int producerId = static_cast<int>(*producerIdOpt);
+        int producerId = *producerIdOpt;
         collectDepInfo(input, DependencyType::VectorToCube, v2cDependencies,
                        producerId, blockInfo.blockId, info);
       }
@@ -595,7 +594,7 @@ void DataDependencyAnalysisPass::analyzeExternalOutputs(
                       "operation.\n");
             continue;
           }
-          int consumerId = static_cast<int>(*consumerIdOpt);
+          int consumerId = *consumerIdOpt;
           auto inserted = handledBlockIds.insert(consumerId).second;
           if (inserted) {
             collectDepInfo(output, DependencyType::CubeToVector,
@@ -653,7 +652,7 @@ void DataDependencyAnalysisPass::analyzeMemoryEffect(DataDependencyInfo &info) {
     if (!currBlockIdOpt || currCoreType.empty()) {
       return WalkResult::advance();
     }
-    int currBlockId = static_cast<int>(*currBlockIdOpt);
+    int currBlockId = *currBlockIdOpt;
 
     for (mlir::Operation *predOp : memDepGraph.getExecBefore(op)) {
       if (isa<annotation::MarkOp, gpu::BarrierOp>(predOp)) {
@@ -700,7 +699,7 @@ void DataDependencyAnalysisPass::analyzeMemoryEffect(DataDependencyInfo &info) {
           predCoreType.empty()) {
         continue;
       }
-      int predBlockId = static_cast<int>(*predBlockIdOpt);
+      int predBlockId = *predBlockIdOpt;
 
       auto [producerBlockId, consumerBlockId] =
           findCommonLevelBlockIds(info, predBlockId, currBlockId);
@@ -839,8 +838,8 @@ std::pair<int, int> DataDependencyAnalysisPass::findCommonLevelBlockIds(
       mlir::Operation *pPrevOp = pAncestors[pIndex - 1];
       auto pPrevIdOpt = CVPipeline::getOpBlockId(pPrevOp);
       auto cPrevIdOpt = CVPipeline::getOpBlockId(before);
-      int pPrevId = pPrevIdOpt ? static_cast<int>(*pPrevIdOpt) : -1;
-      int cPrevId = cPrevIdOpt ? static_cast<int>(*cPrevIdOpt) : -1;
+      int pPrevId = pPrevIdOpt ? *pPrevIdOpt : -1;
+      int cPrevId = cPrevIdOpt ? *cPrevIdOpt : -1;
       if (!pPrevIdOpt) {
         LOG_DEBUG("Warning: Producer ancestor operation has no block ID "
                   "attribute.\n");
