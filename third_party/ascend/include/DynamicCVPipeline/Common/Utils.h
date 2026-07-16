@@ -62,12 +62,6 @@ inline constexpr llvm::StringLiteral kIntraDeps = "ssbuffer.intraDeps";
 inline constexpr llvm::StringLiteral kMemCrossDeps = "ssbuffer.memCrossDeps";
 inline constexpr llvm::StringLiteral kMayNotExec = "ssbuffer.may_not_exec";
 inline constexpr llvm::StringLiteral kClone = "ssbuffer.clone";
-<<<<<<< HEAD
-static constexpr llvm::StringLiteral kInlinableQuantScaleAttr =
-    "enable_fast_tf32_mul";
-inline constexpr llvm::StringLiteral kHIVMMatmulLimitedInCubeAttr =
-    "hivm.matmul_limited_in_cube";
-=======
 inline constexpr llvm::StringLiteral kEnableUbRefineOpt =
     "ssbuffer.enable_ub_refine_opt";
 inline constexpr llvm::StringLiteral kInsertionOptimization =
@@ -76,7 +70,6 @@ static constexpr llvm::StringLiteral kInlinableQuantScaleAttr =
     "enable_fast_tf32_mul";
 inline constexpr llvm::StringLiteral kHIVMMatmulLimitedInCubeAttr =
     "hivm.matmul_limited_in_cube";
->>>>>>> 6b6cf3c22 ([ssbuffer](feat) enable_ub_refine_opt && insertionOptimization (#1037))
 
 inline constexpr const char *ERRCODE_ATTR =
     "triton_ascend.dynamic_cv_pipeline.rc";

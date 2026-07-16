@@ -782,9 +782,6 @@ llvm::LogicalResult UBUsageOptPass::UBUsageOptimization(
   return llvm::success();
 }
 
-<<<<<<< HEAD
-void mlir::triton::UBUsageOptPass::runOnOperation() {
-=======
 llvm::LogicalResult
 UBUsageOptPass::optBroadcast(Block *block,
                              const CVPipeline::MemoryDependenceGraph &memGraph,
@@ -913,7 +910,6 @@ UBUsageOptPass::optSmallBlock(Block *block,
 }
 
 void mlir::triton::UBUsageOptPass::runOnOperation() {
->>>>>>> 6b6cf3c22 ([ssbuffer](feat) enable_ub_refine_opt && insertionOptimization (#1037))
   LOG_DEBUG("--- Pass: UBUsageOpt ---\n");
 
   ModuleOp module = getOperation();

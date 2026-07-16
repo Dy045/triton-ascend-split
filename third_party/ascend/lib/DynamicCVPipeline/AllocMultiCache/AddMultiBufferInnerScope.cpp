@@ -1438,11 +1438,6 @@ static int processDepVal(Value depVal, mlir::scf::ForOp mainLoopForOp,
 
   // Create producer
   OpBuilder producedBuffers(mainLoopForOp.getContext());
-<<<<<<< HEAD
-  producedBuffers.setInsertionPointAfter(depDefinedOp);
-  SmallVector<Operation *> producerNewOps =
-      insertProducerLogic(producedBuffers, depVal, buffers, mainLoopForOp);
-=======
   // When enable_buffer_insert_optimization is on, place the producer chain at
   // the end of depDefinedOp's block_id=X region (after the last op with that
   // block_id). Otherwise keep the original "right after depDefinedOp" anchor.
@@ -1457,7 +1452,6 @@ static int processDepVal(Value depVal, mlir::scf::ForOp mainLoopForOp,
   producedBuffers.setInsertionPointAfter(producerAnchor);
   SmallVector<Operation *> producerNewOps =
       insertProducerLogic(producedBuffers, depVal, buffers, mainLoopForOp);
->>>>>>> 6b6cf3c22 ([ssbuffer](feat) enable_ub_refine_opt && insertionOptimization (#1037))
   addBlockAttrForOps(producerNewOps, producerId, globalBuilder);
   if (buffers.size() > kBufferCountOne) {
     for (auto *op : producerNewOps) {

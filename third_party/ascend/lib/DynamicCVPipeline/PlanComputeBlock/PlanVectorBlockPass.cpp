@@ -319,10 +319,6 @@ collectKeepOps(Block *block, SmallVector<Operation *> toProcess,
   return keepOps;
 }
 
-<<<<<<< HEAD
-static void evictAndRestoreState(
-    Block *block, const SetVector<Operation *> &keepOps,
-=======
 static bool isTensorOperation(Operation *op) {
   for (auto result : op->getResults()) {
     if (isa<RankedTensorType>(result.getType())) {
@@ -446,7 +442,6 @@ extractToProcessFromFuseGroup(Block *block,
 
 static void evictAndRestoreState(
     Block *block, const SetVector<Operation *> &keepOps,
->>>>>>> 6b6cf3c22 ([ssbuffer](feat) enable_ub_refine_opt && insertionOptimization (#1037))
     SmallVector<Operation *> &fuseGroup, DenseMap<Operation *, bool> &visited,
     SmallVector<Operation *> &candidates, DenseMap<Operation *, int> &indegree,
     const CVPipeline::MemoryDependenceGraph &memGraph) {
@@ -494,19 +489,6 @@ static void evictAndRestoreState(
   }
 }
 
-<<<<<<< HEAD
-void refineFuseGroup(Block *block, SmallVector<Operation *> &nowFuseGroup,
-                     DenseMap<Operation *, bool> &visited,
-                     SmallVector<Operation *> &candidates,
-                     DenseMap<Operation *, int> &indegree,
-                     const CVPipeline::MemoryDependenceGraph &memGraph,
-                     ComputeBlockIdManager &bm) {
-  // 1.Find ops in fuse group whose next node is a non-fusable (CUBE-only) op
-  auto toProcess =
-      findOpsAdjacentToCube(block, nowFuseGroup, visited, memGraph);
-  // 2. early return: if cannot find one node which next node is CUBE, need to
-  // check if return or not;
-=======
 void refineFuseGroup(Block *block, SmallVector<Operation *> &nowFuseGroup,
                      DenseMap<Operation *, bool> &visited,
                      SmallVector<Operation *> &candidates,
@@ -525,7 +507,6 @@ void refineFuseGroup(Block *block, SmallVector<Operation *> &nowFuseGroup,
   }
 
   // 3. If still empty after extraction, no op will be cut
->>>>>>> 6b6cf3c22 ([ssbuffer](feat) enable_ub_refine_opt && insertionOptimization (#1037))
   if (toProcess.empty()) {
     LOG_DEBUG("No op will be cut after extraction.\n");
     findCandidates(indegree, candidates, visited, memGraph, bm);
@@ -537,30 +518,17 @@ void refineFuseGroup(Block *block, SmallVector<Operation *> &nowFuseGroup,
   // 4. Collect keepOps transitively (data + memory + loop-carried deps)
   auto keepOps = collectKeepOps(block, toProcess, nowFuseGroup, memGraph);
 
-<<<<<<< HEAD
-  // 4. Remove non-kept ops from fuseGroup and restore BFS state
-  evictAndRestoreState(block, keepOps, nowFuseGroup, visited, candidates,
-                       indegree, memGraph);
-=======
   // 5. Remove non-kept ops from fuseGroup and restore BFS state
   evictAndRestoreState(block, keepOps, nowFuseGroup, visited, candidates,
                        indegree, memGraph);
->>>>>>> 6b6cf3c22 ([ssbuffer](feat) enable_ub_refine_opt && insertionOptimization (#1037))
   LOG_DEBUG("After cutting, kept " << keepOps.size() << "\n");
 }
 
 // Main function to plan vector block id for one block
-<<<<<<< HEAD
-llvm::LogicalResult
-planVectorBlockId(Block *block,
-                  const CVPipeline::MemoryDependenceGraph &memGraph,
-                  ComputeBlockIdManager &bm) {
-=======
 llvm::LogicalResult
 planVectorBlockId(Block *block,
                   const CVPipeline::MemoryDependenceGraph &memGraph,
                   ComputeBlockIdManager &bm, bool isUBRefineOptEnabled) {
->>>>>>> 6b6cf3c22 ([ssbuffer](feat) enable_ub_refine_opt && insertionOptimization (#1037))
   // 1. topo initialize
   llvm::DenseMap<Operation *, int> indegree;
   llvm::SmallVector<Operation *> queue;
@@ -595,13 +563,8 @@ planVectorBlockId(Block *block,
       }
       // finish one group, assign block id and start next iteration
       // Cut error operations before assigning block id
-<<<<<<< HEAD
-      refineFuseGroup(block, nowFuseGroup, visited, queue, indegree, memGraph,
-                      bm);
-=======
       refineFuseGroup(block, nowFuseGroup, visited, queue, indegree, memGraph,
                       bm, isUBRefineOptEnabled);
->>>>>>> 6b6cf3c22 ([ssbuffer](feat) enable_ub_refine_opt && insertionOptimization (#1037))
       LOG_DEBUG("Group after cutting: \n");
       for (auto op : nowFuseGroup) {
         LOG_DEBUG("fuseing: " << *op << "\n");
@@ -636,20 +599,10 @@ void PlanVectorBlockPass::runOnOperation() {
   }
 
   // 2. search blocks in topo order and assign block id for each block
-  llvm::SmallVector<Block *> blocks;
-<<<<<<< HEAD
-  auto result = moduleOp.walk([&](Block *block) {
-    if (llvm::failed(planVectorBlockId(block, memDepGraph, bm))) {
-      return WalkResult::interrupt();
-=======
-  moduleOp.walk([&](Block *block) {
+  auto result = moduleOp.walk([&](Block *block) -> WalkResult {
     if (llvm::failed(
             planVectorBlockId(block, memDepGraph, bm, isUBRefineOptEnabled))) {
-      moduleOp.emitError() << "[" << DEBUG_TYPE
-                           << "] Failed to plan vector block id for block";
-      signalPassFailure();
-      return;
->>>>>>> 6b6cf3c22 ([ssbuffer](feat) enable_ub_refine_opt && insertionOptimization (#1037))
+      return WalkResult::interrupt();
     }
     return WalkResult::advance();
   });

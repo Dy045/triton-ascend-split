@@ -439,10 +439,6 @@ void init_triton_ascend_passes_ttir(py::module &&m) {
     }
   });
 
-<<<<<<< HEAD
-  m.def("set_enable_cube_block_merge",
-        [](bool enable) { mlir::CVPipeline::setEnableCubeBlockMerge(enable); });
-=======
   m.def("set_enable_cube_block_merge",
         [](bool enable) { mlir::CVPipeline::setEnableCubeBlockMerge(enable); });
 
@@ -460,8 +456,6 @@ void init_triton_ascend_passes_ttir(py::module &&m) {
                               builder.getUnitAttr());
           }
         });
-
->>>>>>> 6b6cf3c22 ([ssbuffer](feat) enable_ub_refine_opt && insertionOptimization (#1037))
 }
 
 #if TRITON_ASCEND_HAS_INPROC_COSTMODEL
