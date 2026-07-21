@@ -1638,14 +1638,9 @@ int OpClassifierPass::stampToIR() {
     if (llvm::isa<scf::SCFDialect>(op->getDialect()) && !llvm::isa<scf::ConditionOp>(op))
       continue;
 
-    // For scf.condition, use the parent scf.while's core type
-    if (auto conditionOp = llvm::dyn_cast<scf::ConditionOp>(op)) {
-      if (auto whileOp = llvm::dyn_cast<scf::WhileOp>(conditionOp->getParentOp())) {
-        auto whileIt = opCoreTypes.find(whileOp);
-        if (whileIt != opCoreTypes.end()) {
-          coreType = whileIt->second;
-        }
-      }
+    // scf.condition is always VECTOR (it's the condition check in while's before region)
+    if (llvm::isa<scf::ConditionOp>(op)) {
+      coreType = OP_VECTOR_ONLY;
     }
 
     // Skip linalg operations' internal block operations
