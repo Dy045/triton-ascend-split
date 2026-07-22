@@ -265,8 +265,9 @@ static int tagLoadStoreOpsWithCrossDeps(
         Value ptr = storeOp.getOperand(1);
         if (auto *ptrDefOp = ptr.getDefiningOp()) {
           ptrDefOp->setAttr(
-              mlir::CVPipeline::kCrossCoreDeps, builder.getArrayAttr({builder.getI32IntegerAttr(tid),
-                                                builder.getI32IntegerAttr(1)}));
+              mlir::CVPipeline::kCrossCoreDeps,
+              builder.getArrayAttr({builder.getI32IntegerAttr(tid),
+                                    builder.getI32IntegerAttr(1)}));
           LDBG("Tagged ptr-defining-op with crossDeps={tid=" << tid << ", 1}");
         }
       } else if (auto loadOp = dyn_cast<mlir::LLVM::LoadOp>(op)) {
@@ -566,7 +567,8 @@ static int createOutputBufferPair(Operation *inputAllocOp, int tid, int tcbId,
   auto outputAlloc = builder.create<memref::AllocOp>(loc, memRefType);
   outputAlloc->setAttr(mlir::CVPipeline::kBlockId,
                        builder.getI32IntegerAttr(outputBlockId));
-  outputAlloc->setAttr(mlir::CVPipeline::kTransferId, builder.getI32IntegerAttr(tid));
+  outputAlloc->setAttr(mlir::CVPipeline::kTransferId,
+                       builder.getI32IntegerAttr(tid));
   outputBuffer = outputAlloc.getResult();
 
   // NOTE: output alloc carries no ssbuffer.crossCoreDeps — alloc is a
@@ -579,7 +581,8 @@ static int createOutputBufferPair(Operation *inputAllocOp, int tid, int tcbId,
   outputMark->setAttr("effects", builder.getStrArrayAttr({"write", "read"}));
   outputMark->setAttr(mlir::CVPipeline::kBlockId,
                       builder.getI32IntegerAttr(outputBlockId));
-  outputMark->setAttr(mlir::CVPipeline::kTransferId, builder.getI32IntegerAttr(tid));
+  outputMark->setAttr(mlir::CVPipeline::kTransferId,
+                      builder.getI32IntegerAttr(tid));
   outputMark->setAttr(
       "hivm.tightly_coupled_buffer",
       hivm::HIVMTightlyCoupledBufferAttr::get(builder.getContext(), tcbId));
@@ -781,7 +784,8 @@ static Operation *wrapSyncOpWithScfIf(
   Location loc = op->getLoc();
   auto ifOp = builder.create<scf::IfOp>(loc, TypeRange{}, cond,
                                         true /* withElseRegion */);
-  ifOp->setAttr(mlir::CVPipeline::kBlockId, builder.getI32IntegerAttr(getBlockId(op)));
+  ifOp->setAttr(mlir::CVPipeline::kBlockId,
+                builder.getI32IntegerAttr(getBlockId(op)));
   ifOp->setAttr("ssbuffer.cross_buffer", builder.getI32IntegerAttr(1));
 
   // then branch: clone original op
@@ -800,8 +804,10 @@ static Operation *wrapSyncOpWithScfIf(
     altOp->setAttr(mlir::CVPipeline::kBlockId, builder.getI32IntegerAttr(bid));
   }
   if (tid >= 0) {
-    cloned->setAttr(mlir::CVPipeline::kTransferId, builder.getI32IntegerAttr(tid));
-    altOp->setAttr(mlir::CVPipeline::kTransferId, builder.getI32IntegerAttr(tid));
+    cloned->setAttr(mlir::CVPipeline::kTransferId,
+                    builder.getI32IntegerAttr(tid));
+    altOp->setAttr(mlir::CVPipeline::kTransferId,
+                   builder.getI32IntegerAttr(tid));
   }
   if (op->hasAttr("ssbuffer.analyze_flag_id")) {
     cloned->setAttr("ssbuffer.analyze_flag_id", builder.getUnitAttr());
@@ -857,8 +863,8 @@ static Operation *wrapTransferOpWithScfIfYield(Operation *transferOp,
   // scf.if is the polling-flow control structure, not the data-movement
   // behavior op — the producer role follows the inner fixpipe/copy clones.
   if (isProducer) {
-    auto crossDeps = builder.getArrayAttr({builder.getI32IntegerAttr(tid),
-                                          builder.getI32IntegerAttr(1)});
+    auto crossDeps = builder.getArrayAttr(
+        {builder.getI32IntegerAttr(tid), builder.getI32IntegerAttr(1)});
     thenCloned->setAttr(mlir::CVPipeline::kCrossCoreDeps, crossDeps);
     elseCloned->setAttr(mlir::CVPipeline::kCrossCoreDeps, crossDeps);
   }
@@ -913,8 +919,8 @@ static Operation *wrapTransferOpWithScfIfSimple(Operation *transferOp,
   // [tid, 1]. Mirror of wrapTransferOpWithScfIfYield: behavior op, not
   // the ifOp wrapper, carries the producer role.
   if (isProducer) {
-    auto crossDeps = builder.getArrayAttr({builder.getI32IntegerAttr(tid),
-                                          builder.getI32IntegerAttr(1)});
+    auto crossDeps = builder.getArrayAttr(
+        {builder.getI32IntegerAttr(tid), builder.getI32IntegerAttr(1)});
     thenCloned->setAttr(mlir::CVPipeline::kCrossCoreDeps, crossDeps);
     elseCloned->setAttr(mlir::CVPipeline::kCrossCoreDeps, crossDeps);
   }

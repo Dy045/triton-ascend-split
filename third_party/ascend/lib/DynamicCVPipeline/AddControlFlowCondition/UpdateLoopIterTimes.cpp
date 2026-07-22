@@ -439,8 +439,9 @@ std::pair<int, int> UpdateLoopIterTimesPass::calculateIntraDepsFactor(
       return {-1, -1};
     }
 
-    // If consumer is after producer (ConsumerIdx > producerIdx), calculate required buffer count
-    // ConsumerIdx - producerIdx + 1 represents the buffer count needed to cover this distance
+    // If consumer is after producer (ConsumerIdx > producerIdx), calculate
+    // required buffer count ConsumerIdx - producerIdx + 1 represents the buffer
+    // count needed to cover this distance
     if (ConsumerIdx <= producerIdx) {
       LDBG("producer is after the consumer!");
       return {-1, -1};
@@ -520,19 +521,19 @@ std::pair<int, int> UpdateLoopIterTimesPass::calculateCrossDepsFactor(
 
     // Find producer's position in the other side's ifOps (producerIdx)
     int producerIdx = getProducerIfOpIndex(producerOps, otherSideIfOps,
-                                 otherSideIfOpIndexMap);
+                                           otherSideIfOpIndexMap);
     if (producerIdx == -1) {
       return {-1, -1};
     }
 
-    // If consumer is after producer (comsumerIdx >= producerIdx), calculate required buffer count
-    // comsumerIdx - producerIdx + 1 represents the buffer count needed to cover this distance
-    // If the current compute block executes first (firstIfOp has no consumer),
-    // subtract 1
+    // If consumer is after producer (comsumerIdx >= producerIdx), calculate
+    // required buffer count comsumerIdx - producerIdx + 1 represents the buffer
+    // count needed to cover this distance If the current compute block executes
+    // first (firstIfOp has no consumer), subtract 1
     if (comsumerIdx < producerIdx) {
       // case : C1 -> V1V2V3 -> C2
-      // in this case comsumerIdx < producerIdx, crossDeps hard to process, do not change the loop
-      // iteration times
+      // in this case comsumerIdx < producerIdx, crossDeps hard to process, do
+      // not change the loop iteration times
       LDBG("there is complex case!");
       return {1, 1};
     }
@@ -541,7 +542,8 @@ std::pair<int, int> UpdateLoopIterTimesPass::calculateCrossDepsFactor(
       requiredBuffers = requiredBuffers - 1;
     }
     LDBG("consumer : " << *consumerOp);
-    LDBG("consumer comsumerIdx: " << comsumerIdx << ", producerIdx: " << producerIdx);
+    LDBG("consumer comsumerIdx: " << comsumerIdx
+                                  << ", producerIdx: " << producerIdx);
     LDBG("requiredBuffers: " << requiredBuffers);
     LDBG("buffer: " << x);
     LDBG("runFirst: " << runFirst);
@@ -561,10 +563,10 @@ std::pair<int, int> UpdateLoopIterTimesPass::calculateCrossDepsFactor(
 // calculateIterDepsFactor computes the buffer factor based on iteration
 // dependencies For iter deps: consumer and producer are IfOps within the same
 // forOp Core idea: iteration dependencies are special - consume first, then
-// produce So if consumer ifOp (comsumerIdx) and producer ifOp (producerIdx) have dependency, we
-// need (producerIdx - comsumerIdx) buffers to support the loop extension This function iterates all
-// dependencies from tensorIterArgDepsMap and finds the maximum required buffer
-// count
+// produce So if consumer ifOp (comsumerIdx) and producer ifOp (producerIdx)
+// have dependency, we need (producerIdx - comsumerIdx) buffers to support the
+// loop extension This function iterates all dependencies from
+// tensorIterArgDepsMap and finds the maximum required buffer count
 std::pair<int, int> UpdateLoopIterTimesPass::calculateIterDepsFactor(
     scf::ForOp forOp, SmallVector<scf::IfOp> &ifOps,
     DenseMap<Operation *, int> &ifOpIndex) {
@@ -601,7 +603,8 @@ std::pair<int, int> UpdateLoopIterTimesPass::calculateIterDepsFactor(
     int producerIdx = producerIt->second;
 
     // For each consumer IfOp, find its index (comsumerIdx)
-    // Calculate requiredBuffers = producerIdx - comsumerIdx (consume first, then produce)
+    // Calculate requiredBuffers = producerIdx - comsumerIdx (consume first,
+    // then produce)
     for (scf::IfOp consumerIfOp : consumerIfOps) {
       // Find consumer IfOp index in ifOps list
       auto consumerIt = ifOpIndex.find(consumerIfOp.getOperation());
@@ -612,7 +615,8 @@ std::pair<int, int> UpdateLoopIterTimesPass::calculateIterDepsFactor(
       int comsumerIdx = consumerIt->second;
 
       if (producerIdx <= comsumerIdx) {
-        LDBG("Producer IfOp index (producerIdx) is not greater than consumer IfOp index "
+        LDBG("Producer IfOp index (producerIdx) is not greater than consumer "
+             "IfOp index "
              "(comsumerIdx)!");
         LDBG("arg value: " << relation.iterArg);
         LDBG("Producer IfOp index producerIdx: " << producerIdx);
@@ -621,7 +625,8 @@ std::pair<int, int> UpdateLoopIterTimesPass::calculateIterDepsFactor(
       }
       int requiredBuffers = producerIdx - comsumerIdx + 1;
       LDBG("consumerIfOp : " << consumerIfOp);
-      LDBG("consumer comsumerIdx: " << comsumerIdx << ", producerIdx: " << producerIdx);
+      LDBG("consumer comsumerIdx: " << comsumerIdx
+                                    << ", producerIdx: " << producerIdx);
       LDBG("requiredBuffers: " << requiredBuffers);
 
       if (requiredBuffers * maxX > maxRequiredBuffers * x) {

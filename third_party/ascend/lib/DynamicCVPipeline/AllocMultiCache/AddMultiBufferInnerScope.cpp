@@ -1067,8 +1067,8 @@ insertProducerLogic(OpBuilder &builder, Value depVal,
     if (!producerOp)
       return newOps;
     if (groupId >= 0) {
-      producerOp->setAttr(kIntraDeps,
-                          builder.getI32ArrayAttr({groupId, crossCoreProducerId}));
+      producerOp->setAttr(
+          kIntraDeps, builder.getI32ArrayAttr({groupId, crossCoreProducerId}));
     }
     newOps.push_back(producerOp);
     return newOps;
@@ -1132,8 +1132,7 @@ static int insertConsumerLogic(OpBuilder &builder, Value depVal,
     Operation *consumerOp = handleSingleBufferConsumer(builder, loc, buffers);
     outIfOps.push_back(consumerOp);
     if (groupId >= 0) {
-      consumerOp->setAttr(kIntraDeps,
-                          builder.getI32ArrayAttr({groupId, 0}));
+      consumerOp->setAttr(kIntraDeps, builder.getI32ArrayAttr({groupId, 0}));
     }
     return 0;
   }
@@ -1465,9 +1464,8 @@ static int processDepVal(Value depVal, mlir::scf::ForOp mainLoopForOp,
     }
   }
   producedBuffers.setInsertionPointAfter(producerAnchor);
-  SmallVector<Operation *> producerNewOps =
-      insertProducerLogic(producedBuffers, depVal, buffers, mainLoopForOp,
-                          groupId);
+  SmallVector<Operation *> producerNewOps = insertProducerLogic(
+      producedBuffers, depVal, buffers, mainLoopForOp, groupId);
   addBlockAttrForOps(producerNewOps, producerId, globalBuilder);
   if (buffers.size() > kBufferCountOne) {
     for (auto *op : producerNewOps) {
