@@ -1,4 +1,4 @@
-// RUN: triton-opt --update-for-ops %s --allow-unregistered-dialect | FileCheck %s
+// RUN: triton-opt --update-loop-ops %s --allow-unregistered-dialect | FileCheck %s
 
 // CHECK: func.func @test_pipes_insert
 module attributes {hacc.target = #hacc.target<"Ascend950PR_9579">} {
