@@ -1513,14 +1513,8 @@ void UpdateConditionInfoPass::populateNewThenBlock(
 }
 
 void UpdateConditionInfoPass::populateNewElseBlock(
-    scf::IfOp newIfOp, scf::IfOp oldIfOp, bool needsYield, bool oldHasElse,
-    bool hasCounter, Value counter) {
-  if (!needsYield && !oldHasElse) {
-    LDBG("Skip populating else block: no yield needed and old if has no else."
-         << "\n");
-    return;
-  }
-
+    scf::IfOp newIfOp, scf::IfOp oldIfOp, bool oldHasElse, bool hasCounter,
+    Value counter) {
   Location loc = newIfOp.getLoc();
   Block &newElseBlock = newIfOp.getElseRegion().front();
   SmallVector<Value> oldElseYieldOperands;
@@ -1538,43 +1532,42 @@ void UpdateConditionInfoPass::populateNewElseBlock(
          << oldElseYieldOperands.size() << " old else yield operands." << "\n");
   }
 
-  if (needsYield) {
-    OpBuilder elseBuilder(&newElseBlock, newElseBlock.end());
-    SmallVector<Value> elseYieldOperands;
-    for (Value operand : oldElseYieldOperands) {
-      Value newOperand = operand;
-      auto it = controlVarToLatestValue.find(operand);
-      if (it != controlVarToLatestValue.end()) {
-        newOperand = it->second;
-      }
-      elseYieldOperands.push_back(newOperand);
+  // Always terminate else; creating withElse=true and leaving an empty block
+  // fails verification ("scf.if op expects a non-empty block").
+  OpBuilder elseBuilder(&newElseBlock, newElseBlock.end());
+  SmallVector<Value> elseYieldOperands;
+  for (Value operand : oldElseYieldOperands) {
+    Value newOperand = operand;
+    auto it = controlVarToLatestValue.find(operand);
+    if (it != controlVarToLatestValue.end()) {
+      newOperand = it->second;
     }
+    elseYieldOperands.push_back(newOperand);
+  }
 
-    for (Value var : currentUsedVars) {
-      Value varToUse = var;
-      auto it = controlVarToLatestValue.find(var);
-      if (it != controlVarToLatestValue.end()) {
-        varToUse = it->second;
-      }
-      elseYieldOperands.push_back(varToUse);
+  for (Value var : currentUsedVars) {
+    Value varToUse = var;
+    auto it = controlVarToLatestValue.find(var);
+    if (it != controlVarToLatestValue.end()) {
+      varToUse = it->second;
     }
+    elseYieldOperands.push_back(varToUse);
+  }
 
-    if (hasCounter) {
-      Value counterToUse = counter;
-      auto it = controlVarToLatestValue.find(counter);
-      if (it != controlVarToLatestValue.end()) {
-        counterToUse = it->second;
-      }
-      elseYieldOperands.push_back(counterToUse);
+  if (hasCounter) {
+    Value counterToUse = counter;
+    auto it = controlVarToLatestValue.find(counter);
+    if (it != controlVarToLatestValue.end()) {
+      counterToUse = it->second;
     }
+    elseYieldOperands.push_back(counterToUse);
+  }
 
-    LDBG("Create else yield with " << elseYieldOperands.size() << " operands."
-                                   << "\n");
-    elseBuilder.create<scf::YieldOp>(loc, elseYieldOperands);
-  } else if (oldElseYieldOp) {
+  LDBG("Create else yield with " << elseYieldOperands.size() << " operands."
+                                 << "\n");
+  elseBuilder.create<scf::YieldOp>(loc, elseYieldOperands);
+  if (oldElseYieldOp) {
     oldElseYieldOp->erase();
-    LDBG("Erase old else yield because new if does not need yield values."
-         << "\n");
   }
 }
 
@@ -1588,9 +1581,14 @@ scf::IfOp UpdateConditionInfoPass::createNewIfOpWithBlocks(
 
   bool needsYield = !currentUsedVars.empty() || hasCounter;
   bool oldHasElse = oldIfOp.getElseRegion().hasOneBlock();
+  // Only create else when we will populate it; otherwise the verifier fails
+  // with "scf.if op expects a non-empty block" (common on while: no counter
+  // +step and no control vars => needsYield=false).
+  bool withElse = needsYield || oldHasElse;
   LDBG("Create replacement if op: needs yield "
-       << needsYield << ", old has else " << oldHasElse
-       << ", current used vars " << currentUsedVars.size() << "." << "\n");
+       << needsYield << ", old has else " << oldHasElse << ", with else "
+       << withElse << ", current used vars " << currentUsedVars.size() << "."
+       << "\n");
 
   Block &oldThenBlock = oldIfOp.getThenRegion().front();
   Operation *oldThenYieldOp = nullptr;
@@ -1599,7 +1597,7 @@ scf::IfOp UpdateConditionInfoPass::createNewIfOpWithBlocks(
   SmallVector<Type> resultTypes =
       buildNewIfResultTypes(oldIfOp, hasCounter, counter);
   scf::IfOp newIfOp =
-      builder.create<scf::IfOp>(loc, resultTypes, combinedCond, true);
+      builder.create<scf::IfOp>(loc, resultTypes, combinedCond, withElse);
   LDBG("Created replacement if op with " << resultTypes.size() << " results."
                                          << "\n");
 
@@ -1609,8 +1607,9 @@ scf::IfOp UpdateConditionInfoPass::createNewIfOpWithBlocks(
 
   populateNewThenBlock(newIfOp, oldThenBlock, oldThenYieldOp, oldYieldOperands,
                        varUpdateTypes, hasCounter, counter, step);
-  populateNewElseBlock(newIfOp, oldIfOp, needsYield, oldHasElse, hasCounter,
-                       counter);
+  if (withElse) {
+    populateNewElseBlock(newIfOp, oldIfOp, oldHasElse, hasCounter, counter);
+  }
 
   for (size_t i = 0; i < oldIfOp.getNumResults(); ++i) {
     oldIfOp.getResult(i).replaceAllUsesWith(newIfOp.getResult(i));
