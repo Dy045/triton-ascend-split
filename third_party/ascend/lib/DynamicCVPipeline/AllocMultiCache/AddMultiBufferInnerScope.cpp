@@ -2036,9 +2036,39 @@ setupWhileIterArgCounter(const MainLoop &loop, OpBuilder &builder) {
           return;
 
         // Increment the counter and append to the yielded operands list.
+        // Determine the block_id by inspecting the surrounding ops in the
+        // do-region (use the last op with a block_id attribute, since the
+        // counter participates in the do-region's main work and should be
+        // tagged consistently with those ops). Falling back to the
+        // main_loop's block_id keeps the legacy behavior when no other op
+        // in the do-region is tagged.
+        std::optional<int> counterBlockId;
+        if (Block *doBlock = ab.getInsertionBlock()) {
+          for (Operation &op : llvm::reverse(*doBlock)) {
+            if (auto id = getOpBlockId(&op); id.has_value()) {
+              counterBlockId = id;
+              break;
+            }
+          }
+        }
+        if (!counterBlockId)
+          counterBlockId = getOpBlockId(oldWhile);
+
         Value one = ab.create<arith::ConstantIntOp>(al, 1, 32);
         Value nextCounter =
             ab.create<arith::AddIOp>(al, counterIterArg, one);
+
+        // Tag the counter arithmetic with the resolved block_id so it is
+        // consistent with the surrounding do-region ops. Without this the
+        // polling ops are untyped and break downstream consumers that walk
+        // ops by block_id (e.g. dispatch / buffer_index calc walks via
+        // getOpBlockId).
+        if (counterBlockId) {
+          one.getDefiningOp()->setAttr(kBlockId,
+                                       ab.getI32IntegerAttr(*counterBlockId));
+          nextCounter.getDefiningOp()->setAttr(
+              kBlockId, ab.getI32IntegerAttr(*counterBlockId));
+        }
 
         SmallVector<Value> newYieldOps;
         for (Value operand : oldYield->getOperands()) {
