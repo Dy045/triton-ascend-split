@@ -556,6 +556,12 @@ def linalg_to_bin_enable_npu_compile_910_95(linalg: str, metadata, opt):
                 f"--enable-code-motion={code_motion}",
             ]
 
+        enable_preload = metadata["enable_preload"]
+        if enable_preload is not None:
+            _compile_option_list += [
+                f"--enable-preload={enable_preload}",
+            ]
+
         disable_tightly_coupled_buffer_reuse = metadata["disable_tightly_coupled_buffer_reuse"]
         if disable_tightly_coupled_buffer_reuse:
             _compile_option_list += ["--disable-tightly-coupled-buffer-reuse"]
@@ -1047,7 +1053,7 @@ class NPUOptions:
     enable_cube_block_merge: bool = False
     enable_ub_refine_opt: bool = False
     # Multi-cache insertion optimization: avoid redundant tensor compute in the middle of an `if`.
-    enable_buffer_insert_optimization: bool = False
+    enable_buffer_insert_optimization: bool = True
     hfusion_enable_multiple_consumer_fusion: bool = False
     has_auto_blockify_blacklist_op: Optional[bool] = None
     intra_cache_num: int = None
