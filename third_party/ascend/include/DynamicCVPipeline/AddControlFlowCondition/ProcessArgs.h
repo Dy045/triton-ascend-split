@@ -48,6 +48,21 @@ struct SharedArgInfo {
         newArgIndex(newIdx), nonOwnerBlockId(nonOwner) {}
 };
 
+// Per-whileOp state for cloning cond-used iter_arg update chains into the new
+// scf.while's after body. Populated by planWhileIterArgDescriptors; consumed
+// by cloneWhileBlockChains, buildNewWhileYield, recordWhileBlockArgMap.
+struct WhileIterArgClonePlan {
+  // Per-origIdx metadata, all keyed on the original iter_arg index.
+  llvm::DenseMap<unsigned, Operation *> compOp;
+  llvm::DenseMap<unsigned, llvm::DenseSet<Operation *>> chainOps;
+  llvm::DenseMap<unsigned, unsigned> posInClonedVec;
+  // (blockId, newArgIdx, origIdx) triples in planning order (one per
+  // (blockId, cond-used iter_arg) pair).
+  SmallVector<std::tuple<int, unsigned, unsigned>> newArgDescriptors;
+  // Output: cloned compOp results per blockId, indexed by posInClonedVec.
+  llvm::DenseMap<int, SmallVector<Value>> clonedPerBlock;
+};
+
 class ProcessArgsPass
     : public PassWrapper<ProcessArgsPass, OperationPass<ModuleOp>> {
 public:
@@ -57,11 +72,39 @@ public:
 
   LogicalResult processSharedIterArgs(ModuleOp module);
 
+  // Snapshots the original iter_args of every scf.while op with main_loop
+  // attr, then for each scf.while op clones the update chain of every
+  // iter_arg used in scf.condition into every block (group of consecutive
+  // ops with the same ssbuffer.block_id) in the do region. Records the
+  // while op -> block_id -> (new_arg_idx, old_arg_idx) mapping in
+  // ControlFlowConditionInfo for downstream passes.
+  LogicalResult updateIndependentCondsInWhileBlocks(ModuleOp module);
+
+  // Per-whileOp driver for updateIndependentCondsInWhileBlocks.
+  LogicalResult processWhileIterArgsInWhileOp(scf::WhileOp whileOp,
+                                              ControlFlowConditionInfo *info);
+
+  // Per-op driver for shared-iter_args processing.
+  LogicalResult processSharedIterArgsInLoop(Operation *op,
+                                            ControlFlowConditionInfo *info);
+
   void setConditionInfo(ControlFlowConditionInfo *info_) { info = info_; }
 
   llvm::StringRef getArgument() const override { return "process-args"; }
 
   ControlFlowConditionInfo *info = nullptr;
+
+  // Original iter_args of every scf.while op with main_loop attr, captured at
+  // the start of ProcessArgs. Used to identify iter_args referenced by
+  // scf.condition.
+  llvm::DenseMap<scf::WhileOp, SmallVector<unsigned>>
+      originalWhileIterArgIndices;
+
+  // Local copy of whileBlockArgMap; also filled into info->whileBlockArgMap
+  // when info is set, so the mapping is observable when --process-args runs
+  // standalone (where `info` may be null).
+  llvm::DenseMap<scf::WhileOp, llvm::DenseMap<int, llvm::DenseMap<int, int>>>
+      localWhileBlockArgMap;
 };
 
 std::unique_ptr<OperationPass<ModuleOp>> createProcessArgsPass();

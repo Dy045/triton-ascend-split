@@ -595,25 +595,32 @@ static bool isScalarType(Value value) {
   return !isa<RankedTensorType>(value.getType());
 }
 
-// Helper: Check if a value is a scalar iter_arg from scf.for
-// An iter_arg is a BlockArgument of scf.for's loop body, and it must be scalar
-// type
+// Helper: Check if a value is a scalar iter_arg from scf.for or scf.while
+// An iter_arg is a BlockArgument of scf.for's loop body or scf.while's after
+// region, and it must be scalar type
 static bool isScalarIterArgOp(Value iterArg) {
-  // iter_arg is a BlockArgument of scf.for's body
+  // iter_arg is a BlockArgument of scf.for's body or scf.while's after region
   auto blockArg = dyn_cast<BlockArgument>(iterArg);
   if (!blockArg)
     return false;
-  // Check if parent is scf.for
+  // Check if parent is scf.for or scf.while
   Operation *parentOp = blockArg.getOwner()->getParentOp();
-  if (!isa<scf::ForOp>(parentOp))
-    return false;
-  // Check if the iter_arg is scalar type (not tensor)
-  return isScalarType(iterArg);
+  if (isa<scf::ForOp>(parentOp))
+    return isScalarType(iterArg);
+  // For scf.while, check if it's an after-region argument
+  if (auto whileOp = dyn_cast<scf::WhileOp>(parentOp)) {
+    // Check if blockArg belongs to the after body
+    Block *afterBlock = whileOp.getAfterBody()->getNextNode();
+    if (blockArg.getOwner() == afterBlock) {
+      return isScalarType(iterArg);
+    }
+  }
+  return false;
 }
 
 // Helper: Find iter_arg initialization op and yield-assigning op for scf.for
-// loop-carried scalar When a def comes from an scf.for iter_arg and is a scalar
-// compute op, we need to:
+// or scf.while loop-carried scalar. When a def comes from an scf.for/scf.while
+// iter_arg and is a scalar compute op, we need to:
 // 1. Find the iter_arg's initialization op (the op that provides the initial
 // value)
 // 2. Find the yieldOp, then trace to the op that provides the yielded value
@@ -626,45 +633,78 @@ findIterArgUpstreamOps(Value def,
   if (!blockArg)
     return;
 
-  // Check if parent is scf.for
+  // Check if parent is scf.for or scf.while
   Operation *parentOp = blockArg.getOwner()->getParentOp();
   auto forOp = dyn_cast<scf::ForOp>(parentOp);
-  if (!forOp)
+  auto whileOp = dyn_cast<scf::WhileOp>(parentOp);
+  if (!forOp && !whileOp)
     return;
 
-  // Get the iter_arg index from block argument
-  unsigned argIdx = blockArg.getArgNumber();
+  // Handle scf.for
+  if (forOp) {
+    unsigned argIdx = blockArg.getArgNumber();
+    if (argIdx > forOp.getInitArgs().size() || argIdx == 0)
+      return;
+    Value initValue = forOp.getInitArgs()[argIdx - 1];
+    if (!isScalarType(initValue))
+      return;
 
-  // Get the iter_arg and check its type - must be scalar (not tensor)
-  // The init value is at forOp.getInitArgs()[argIdx]
-  if (argIdx > forOp.getInitArgs().size() || argIdx == 0)
-    return;
-  Value initValue = forOp.getInitArgs()[argIdx - 1];
-  if (!isScalarType(initValue))
-    return;
+    Operation *initDef = initValue.getDefiningOp();
+    if (initDef && initDef != forOp) {
+      LLVM_DEBUG(DBGS() << "[findIterArgUpstreamOps] init def: " << *initDef
+                        << "\n");
+      upstreamOps.push_back(initDef);
+    }
 
-  // Find the initialization op for this iter_arg
-  Operation *initDef = initValue.getDefiningOp();
-  if (initDef && initDef != forOp) {
-    LLVM_DEBUG(DBGS() << "[findIterArgUpstreamOps] init def: " << *initDef
-                      << "\n");
-    upstreamOps.push_back(initDef);
+    Operation *yieldOp = forOp.getBody()->getTerminator();
+    if (!isa<scf::YieldOp>(yieldOp) || argIdx > yieldOp->getNumOperands())
+      return;
+
+    Value yieldedValue = yieldOp->getOperand(argIdx - 1);
+    Operation *yieldedDef = yieldedValue.getDefiningOp();
+    if (yieldedDef && yieldedDef != forOp) {
+      LLVM_DEBUG(DBGS() << "[findIterArgUpstreamOps] yielded def: " << *yieldedDef
+                        << "\n");
+      upstreamOps.push_back(yieldedDef);
+    }
+    return;
   }
 
-  // Find the yieldOp and the op that provides the yielded value
-  // The yieldOp has operands corresponding to the iteration results
-  // For iter_arg i, yieldOp.getOperand(i) is the value yielded for that
-  // iter_arg
-  Operation *yieldOp = forOp.getBody()->getTerminator();
-  if (!isa<scf::YieldOp>(yieldOp) || argIdx > yieldOp->getNumOperands())
-    return;
+  // Handle scf.while
+  if (whileOp) {
+    // Get the iter_arg index from block argument in after region
+    unsigned argIdx = blockArg.getArgNumber();
+    auto afterArgs = whileOp.getAfterArguments();
+    if (argIdx >= afterArgs.size())
+      return;
 
-  Value yieldedValue = yieldOp->getOperand(argIdx - 1);
-  Operation *yieldedDef = yieldedValue.getDefiningOp();
-  if (yieldedDef && yieldedDef != forOp) {
-    LLVM_DEBUG(DBGS() << "[findIterArgUpstreamOps] yielded def: " << *yieldedDef
-                      << "\n");
-    upstreamOps.push_back(yieldedDef);
+    // The init value is at whileOp.getInits()[argIdx]
+    auto inits = whileOp.getInits();
+    if (argIdx >= inits.size())
+      return;
+    Value initValue = inits[argIdx];
+    if (!isScalarType(initValue))
+      return;
+
+    Operation *initDef = initValue.getDefiningOp();
+    if (initDef && initDef != whileOp) {
+      LLVM_DEBUG(DBGS() << "[findIterArgUpstreamOps] while init def: " << *initDef
+                        << "\n");
+      upstreamOps.push_back(initDef);
+    }
+
+    // Find the yieldOp in after body and the op that provides the yielded value
+    Operation *yieldOp = whileOp.getAfterBody()->getTerminator();
+    if (!isa<scf::YieldOp>(yieldOp) || argIdx >= yieldOp->getNumOperands())
+      return;
+
+    Value yieldedValue = yieldOp->getOperand(argIdx);
+    Operation *yieldedDef = yieldedValue.getDefiningOp();
+    if (yieldedDef && yieldedDef != whileOp) {
+      LLVM_DEBUG(DBGS() << "[findIterArgUpstreamOps] while yielded def: " << *yieldedDef
+                        << "\n");
+      upstreamOps.push_back(yieldedDef);
+    }
   }
 }
 
@@ -838,13 +878,14 @@ void OpClassifierPass::markFillOpsAsCube() {
       outsIsCube = true;
       LLVM_DEBUG(DBGS() << "\tfill outs defined by CUBE op: "
                         << outsDef->getName().getStringRef() << "\n");
-    } else if (!outsDef) { // Case 2: outs is a BlockArgument (scf.for/scf.if
+    } else if (!outsDef) { // Case 2: outs is a BlockArgument (scf.for/scf.if/scf.while
                            // iter_arg)
       auto blockArg = dyn_cast<BlockArgument>(outs);
       if (blockArg) {
         Operation *parentOp = blockArg.getOwner()->getParentOp();
-        // Check if it's an scf.for or scf.if iter_arg that is CUBE
-        if ((isa<scf::ForOp>(parentOp) || isa<scf::IfOp>(parentOp)) &&
+        // Check if it's an scf.for, scf.if, or scf.while iter_arg that is CUBE
+        if ((isa<scf::ForOp>(parentOp) || isa<scf::IfOp>(parentOp) ||
+             isa<scf::WhileOp>(parentOp)) &&
             opCoreTypes[parentOp] == OP_CUBE_ONLY) {
           outsIsCube = true;
           LLVM_DEBUG(DBGS() << "\tfill outs is CUBE iter_arg of: "
@@ -1056,16 +1097,54 @@ bool OpClassifierPass::isCubeLoaderForOp(scf::ForOp forOp) {
   return !disqualified;
 }
 
+bool OpClassifierPass::isCubeLoaderForWhileOp(scf::WhileOp whileOp) {
+  // Every result must be live and used only by CUBE consumers. A single
+  // non-cube (or scf.yield) user disqualifies the loop.
+  bool hasCubeConsumer = false;
+  for (Value result : whileOp.getResults()) {
+    for (Operation *user : result.getUsers()) {
+      if (isa<linalg::MatmulOp>(user) || getCoreType(user) == OP_CUBE_ONLY) {
+        hasCubeConsumer = true;
+        continue;
+      }
+      return false;
+    }
+  }
+  if (!hasCubeConsumer) {
+    return false;
+  }
+
+  // The after body (including nested regions) must be pure data movement.
+  bool disqualified = false;
+  whileOp.getAfterBody()->walk([&](Operation *op) {
+    if (op == whileOp.getOperation()) {
+      return WalkResult::advance();
+    }
+    if (isDisqualifyingLoaderOp(op)) {
+      disqualified = true;
+      return WalkResult::interrupt();
+    }
+    return WalkResult::advance();
+  });
+  return !disqualified;
+}
+
 int OpClassifierPass::penetrateCubeIntoForLoops() {
   // Collect first so recoloring earlier loops cannot perturb the scan.
-  llvm::SmallVector<scf::ForOp> loaderLoops;
+  llvm::SmallVector<scf::ForOp> loaderForLoops;
+  llvm::SmallVector<scf::WhileOp> loaderWhileLoops;
   getOperation().walk([&](scf::ForOp forOp) {
     if (isCubeLoaderForOp(forOp)) {
-      loaderLoops.push_back(forOp);
+      loaderForLoops.push_back(forOp);
+    }
+  });
+  getOperation().walk([&](scf::WhileOp whileOp) {
+    if (isCubeLoaderForWhileOp(whileOp)) {
+      loaderWhileLoops.push_back(whileOp);
     }
   });
 
-  for (scf::ForOp forOp : loaderLoops) {
+  for (scf::ForOp forOp : loaderForLoops) {
     // Set core_type to OP_CUBE_ONLY for scf.for.
     forOp.getBody()->walk([&](Operation *op) {
       if (op == forOp.getOperation() ||
@@ -1078,6 +1157,21 @@ int OpClassifierPass::penetrateCubeIntoForLoops() {
       }
     });
     opCoreTypes[forOp] = OP_CUBE_ONLY;
+  }
+
+  for (scf::WhileOp whileOp : loaderWhileLoops) {
+    // Set core_type to OP_CUBE_ONLY for scf.while.
+    whileOp.getAfterBody()->walk([&](Operation *op) {
+      if (op == whileOp.getOperation() ||
+          isa<scf::SCFDialect>(op->getDialect())) {
+        return;
+      }
+      auto it = opCoreTypes.find(op);
+      if (it != opCoreTypes.end()) {
+        it->second = OP_CUBE_ONLY;
+      }
+    });
+    opCoreTypes[whileOp] = OP_CUBE_ONLY;
   }
 
   return 0;
@@ -1409,25 +1503,41 @@ int OpClassifierPass::handleSCFYield() {
 }
 
 OpCoreType OpClassifierPass::getForInitCoreType(OpOperand *operand) const {
-  auto forOp = llvm::dyn_cast<scf::ForOp>(operand->getOwner());
-  if (!forOp) {
-    return OP_UNDETERMINED;
+  // Handle scf.for
+  if (auto forOp = llvm::dyn_cast<scf::ForOp>(operand->getOwner())) {
+    auto iterArg = forOp.getTiedLoopRegionIterArg(operand);
+    if (!iterArg) {
+      // the result is used as lower/upper bound or step
+      return OP_UNDETERMINED;
+    }
+    auto sourceOperand = forOp.getTiedLoopYieldedValue(iterArg);
+    if (!sourceOperand) {
+      return OP_UNDETERMINED;
+    }
+    auto defOp = sourceOperand->get().getDefiningOp();
+    if (!defOp) {
+      // might be a blockarg, not necessary for our use-case
+      return OP_UNDETERMINED;
+    }
+    return getCoreType(defOp);
   }
-  auto iterArg = forOp.getTiedLoopRegionIterArg(operand);
-  if (!iterArg) {
-    // the result is used as lower/upper bound or step
-    return OP_UNDETERMINED;
+  // Handle scf.while
+  if (auto whileOp = llvm::dyn_cast<scf::WhileOp>(operand->getOwner())) {
+    auto iterArg = whileOp.getTiedLoopRegionIterArg(operand);
+    if (!iterArg) {
+      return OP_UNDETERMINED;
+    }
+    auto sourceOperand = whileOp.getTiedLoopYieldedValue(iterArg);
+    if (!sourceOperand) {
+      return OP_UNDETERMINED;
+    }
+    auto defOp = sourceOperand->get().getDefiningOp();
+    if (!defOp) {
+      return OP_UNDETERMINED;
+    }
+    return getCoreType(defOp);
   }
-  auto sourceOperand = forOp.getTiedLoopYieldedValue(iterArg);
-  if (!sourceOperand) {
-    return OP_UNDETERMINED;
-  }
-  auto defOp = sourceOperand->get().getDefiningOp();
-  if (!defOp) {
-    // might be a blockarg, not necessary for our use-case
-    return OP_UNDETERMINED;
-  }
-  return getCoreType(defOp);
+  return OP_UNDETERMINED;
 }
 
 // ============================================================================
@@ -1532,7 +1642,7 @@ void OpClassifierPass::splitOperationForCubeAndVector(
         continue;
       }
       OpCoreType coreType = getCoreType(user);
-      if (llvm::isa<scf::ForOp>(user)) {
+      if (llvm::isa<scf::ForOp, scf::WhileOp>(user)) {
         coreType = getForInitCoreType(&use);
       }
       if (coreType == OP_VECTOR_ONLY) {
@@ -1600,9 +1710,14 @@ int OpClassifierPass::stampToIR() {
       continue;
     OpCoreType coreType = it->second;
 
-    // Skip scf dialect operations
-    if (llvm::isa<scf::SCFDialect>(op->getDialect()))
+    // Skip most scf dialect operations except scf.condition (terminator in while's before region)
+    if (llvm::isa<scf::SCFDialect>(op->getDialect()) && !llvm::isa<scf::ConditionOp>(op))
       continue;
+
+    // scf.condition is always VECTOR (it's the condition check in while's before region)
+    if (llvm::isa<scf::ConditionOp>(op)) {
+      coreType = OP_VECTOR_ONLY;
+    }
 
     // Skip linalg operations' internal block operations
     Operation *parent = op->getParentOp();

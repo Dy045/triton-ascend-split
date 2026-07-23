@@ -247,14 +247,29 @@ findOpsAdjacentToCube(Block *block, const SmallVector<Operation *> &fuseGroup,
 
 static int getLoopCarriedArgIndex(Value operand, Block *block) {
   auto barg = dyn_cast<BlockArgument>(operand);
-  if (!barg || barg.getOwner() != block ||
-      !isa<scf::ForOp>(block->getParentOp())) {
+  if (!barg || barg.getOwner() != block) {
     return -1;
   }
-  unsigned argIdx = barg.getArgNumber();
-  if (argIdx == 0) {
+
+  auto parentOp = block->getParentOp();
+  if (!isa<scf::ForOp, scf::WhileOp>(parentOp)) {
     return -1;
   }
+
+  auto *terminator = block->getTerminator();
+  if (!terminator || !isa<scf::YieldOp>(terminator)) {
+    return -1;
+  }
+
+  unsigned numArgs = block->getNumArguments();
+  unsigned numYieldOperands = terminator->getNumOperands();
+  int offset = (int)numArgs - (int)numYieldOperands;
+  int argIdx = (int)barg.getArgNumber() - offset;
+
+  if (argIdx < 0 || argIdx >= (int)numYieldOperands) {
+    return -1;
+  }
+
   return argIdx;
 }
 
@@ -286,9 +301,15 @@ collectKeepOps(Block *block, SmallVector<Operation *> toProcess,
         continue;
       }
       auto barg = cast<BlockArgument>(operand);
-      auto *yieldOp = barg.getOwner()->getTerminator();
-      auto *yieldedDef = yieldOp->getOperand(argIdx - 1).getDefiningOp();
-      if (!keepOps.contains(yieldedDef) &&
+      auto *terminator = barg.getOwner()->getTerminator();
+      if (!terminator || !isa<scf::YieldOp>(terminator)) {
+        continue;
+      }
+
+      Value yielded = terminator->getOperand(argIdx);
+      Operation *yieldedDef = yielded.getDefiningOp();
+
+      if (yieldedDef && !keepOps.contains(yieldedDef) &&
           llvm::is_contained(fuseGroup, yieldedDef)) {
         toProcess.push_back(yieldedDef);
       }
@@ -382,16 +403,16 @@ extractToProcessFromFuseGroup(Block *block,
   }
 
   SetVector<Operation *> toRemove;
-  auto forOp = dyn_cast<scf::ForOp>(block->getParentOp());
-  if (forOp) {
+  auto *terminator = block->getTerminator();
+  if (terminator && isa<scf::YieldOp>(terminator) &&
+      isa<scf::ForOp, scf::WhileOp>(block->getParentOp())) {
     for (auto op : nowFuseGroup) {
       for (auto operand : op->getOperands()) {
         int argIdx = getLoopCarriedArgIndex(operand, block);
-        if (argIdx <= 0) {
+        if (argIdx == -1) {
           continue;
         }
-        auto *yieldOp = block->getTerminator();
-        auto yieldOperand = yieldOp->getOperand(argIdx - 1);
+        auto yieldOperand = terminator->getOperand(argIdx);
         auto *defOp = yieldOperand.getDefiningOp();
         if (defOp && bm.getBlockIdByOp(defOp) == -1 &&
             !llvm::is_contained(nowFuseGroup, defOp)) {

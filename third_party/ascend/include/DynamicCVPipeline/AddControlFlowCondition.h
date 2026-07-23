@@ -55,25 +55,27 @@ struct TensorIterArgIfOpVars {
 };
 
 struct ControlFlowConditionInfo {
-  llvm::DenseMap<scf::ForOp, SmallVector<int>> blockCounters;
-  llvm::DenseMap<scf::ForOp, int> blockCounterNums;
-  llvm::DenseMap<scf::ForOp, SmallVector<int>> innerDepConds;
+  // Keys are the main-loop op (scf.for or scf.while carrying
+  // ssbuffer.main_loop)
+  llvm::DenseMap<Operation *, SmallVector<int>> blockCounters;
+  llvm::DenseMap<Operation *, int> blockCounterNums;
+  llvm::DenseMap<Operation *, SmallVector<int>> innerDepConds;
 
   llvm::DenseMap<Operation *, SmallVector<Operation *>> crossCoreDependentMap;
-  llvm::DenseMap<scf::ForOp,
+  llvm::DenseMap<Operation *,
                  llvm::DenseMap<Operation *, SmallVector<Operation *>>>
       intraCoreDependentMap;
   // Used to store the producer/consumer relationship between the tensor type
   // iter_args in the main_loop and ssbuffer.if Note: vector index corresponds
-  // to iter arg index in the for op
-  llvm::DenseMap<scf::ForOp, llvm::SmallVector<TensorIterArgIfOpRelation>>
+  // to iter arg index in the main-loop op
+  llvm::DenseMap<Operation *, llvm::SmallVector<TensorIterArgIfOpRelation>>
       tensorIterArgDepsMap;
   // Used to record the index of the control condition variable for the newly
   // created iter_args for tensor iter_args
-  llvm::DenseMap<scf::ForOp, llvm::DenseMap<Value, SmallVector<int>>>
+  llvm::DenseMap<Operation *, llvm::DenseMap<Value, SmallVector<int>>>
       tensorIterArgIndicesMap;
 
-  // unique counter value for each ifblock
+  // unique counter value for each ifblock scf.for only.
   llvm::DenseMap<scf::IfOp, Value> cntArgs;
 
   // DAG for if block cross-core dependencies
@@ -83,6 +85,15 @@ struct ControlFlowConditionInfo {
   // Buffer counts for flowOpt condition
   int intraCoreBufferCount = 0;
   int crossCoreBufferCount = 0;
+
+  // For each scf.while op with main_loop attribute, record the per-block new
+  // iter_args that mirror the iter_args used in scf.condition.
+  // Outer key: the scf.while op.
+  // Inner key: block_id of the block where the new iter_arg is used.
+  // Innermost key: new iter_arg index in the new while op.
+  // Value: original iter_arg index in the original while op.
+  llvm::DenseMap<scf::WhileOp, llvm::DenseMap<int, llvm::DenseMap<int, int>>>
+      whileBlockArgMap;
 };
 
 class AddControlFlowConditionPass

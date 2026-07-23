@@ -1,4 +1,4 @@
-// RUN: triton-opt --update-for-ops %s | FileCheck %s
+// RUN: triton-opt --update-loop-ops %s | FileCheck %s
 
 // Unit Test for Tensor Iter Arg Eq Conditions
 // This test verifies that the AddControlFlowCondition pass:
