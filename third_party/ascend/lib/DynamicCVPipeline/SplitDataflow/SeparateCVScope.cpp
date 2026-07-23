@@ -459,6 +459,9 @@ static bool isControlFlowGatingUse(OpOperand &use) {
   if (isa<scf::IfOp>(user)) {
     return operandIndex == 0;
   }
+  if (isa<scf::WhileOp>(user)) {
+    return false;
+  }
   return false;
 }
 
@@ -698,49 +701,85 @@ static LogicalResult neutralizeYieldInRegion(Operation *op,
     }
 
     for (Block &block : region) {
-      auto yieldOp = dyn_cast<scf::YieldOp>(block.getTerminator());
-      if (!yieldOp) {
-        continue;
-      }
-
-      OpBuilder builder(yieldOp);
-      for (unsigned i = 0; i < yieldOp.getNumOperands(); ++i) {
-        if (info.getResultType(i) == scopeType) {
-          continue;
-        }
-
-        // First defense: skip neutralization when an in-loop consumer reads the
-        // carried value through an iter_arg.
-        if (needsLoopCarryPreserve(op, i, scopeType)) {
-          continue;
-        }
-
-        Value oldOperand = yieldOp.getOperand(i);
-
-        // Second defense: skip the result-user check when the value is produced
-        // by a foreign-scope op to prevent it from being trapped.
-        bool isLoopOp = isa<scf::ForOp, scf::WhileOp>(op);
-        if ((!isLoopOp || !isProducedByForeignScope(oldOperand, scopeType)) &&
-            i < op->getNumResults()) {
-          if (Operation *resultUser =
-                  findLiveUser(op->getResult(i), scopeType)) {
-            logDebug("skip neutralizing yield operand #", i, " for scope ",
-                     scopeType, " because parent result #", i,
-                     " still has live user '",
-                     resultUser->getName().getStringRef(), "'");
+      Operation *terminator = block.getTerminator();
+      if (auto yieldOp = dyn_cast<scf::YieldOp>(terminator)) {
+        OpBuilder builder(yieldOp);
+        for (unsigned i = 0; i < yieldOp.getNumOperands(); ++i) {
+          if (info.getResultType(i) == scopeType) {
             continue;
           }
-        }
 
-        Value replacement =
-            buildNeutralValue(builder, oldOperand, loc, scopeType);
-        if (!replacement) {
-          logDebug("neutralizeYieldInRegion failed for op '",
-                   op->getName().getStringRef(), "' at operand #", i,
-                   " in scope ", scopeType);
-          return failure();
+          // First defense: skip neutralization when an in-loop consumer reads
+          // the carried value through an iter_arg.
+          if (needsLoopCarryPreserve(op, i, scopeType)) {
+            continue;
+          }
+
+          Value oldOperand = yieldOp.getOperand(i);
+
+          // Second defense: skip the result-user check when the value is
+          // produced by a foreign-scope op to prevent it from being trapped.
+          bool isLoopOp = isa<scf::ForOp, scf::WhileOp>(op);
+          if ((!isLoopOp || !isProducedByForeignScope(oldOperand, scopeType)) &&
+              i < op->getNumResults()) {
+            if (Operation *resultUser =
+                    findLiveUser(op->getResult(i), scopeType)) {
+              logDebug("skip neutralizing yield operand #", i, " for scope ",
+                       scopeType, " because parent result #", i,
+                       " still has live user '",
+                       resultUser->getName().getStringRef(), "'");
+              continue;
+            }
+          }
+
+          Value replacement =
+              buildNeutralValue(builder, oldOperand, loc, scopeType);
+          if (!replacement) {
+            logDebug("neutralizeYieldInRegion failed for op '",
+                     op->getName().getStringRef(), "' at operand #", i,
+                     " in scope ", scopeType);
+            return failure();
+          }
+          yieldOp.setOperand(i, replacement);
         }
-        yieldOp.setOperand(i, replacement);
+      } else if (auto conditionOp = dyn_cast<scf::ConditionOp>(terminator)) {
+        OpBuilder builder(conditionOp);
+        for (unsigned i = 0; i < conditionOp.getArgs().size(); ++i) {
+          // First defense: never neutralize slots belonging to current scope.
+          if (info.getResultType(i) == scopeType) {
+            continue;
+          }
+          if (needsLoopCarryPreserve(op, i, scopeType)) {
+            continue;
+          }
+
+          Value oldOperand = conditionOp.getArgs()[i];
+
+          // Second defense: skip the result-user check when the value is
+          // produced by a foreign-scope op to prevent it from being trapped.
+          bool isLoopOp = isa<scf::ForOp, scf::WhileOp>(op);
+          if ((!isLoopOp || !isProducedByForeignScope(oldOperand, scopeType)) &&
+              i < op->getNumResults()) {
+            if (Operation *resultUser =
+                    findLiveUser(op->getResult(i), scopeType)) {
+              logDebug("skip neutralizing condition arg #", i, " for scope ",
+                       scopeType, " because parent result #", i,
+                       " still has live user '",
+                       resultUser->getName().getStringRef(), "'");
+              continue;
+            }
+          }
+
+          Value replacement =
+              buildNeutralValue(builder, oldOperand, loc, scopeType);
+          if (!replacement) {
+            logDebug("neutralizeYieldInRegion failed for op '",
+                     op->getName().getStringRef(), "' at condition arg #", i,
+                     " in scope ", scopeType);
+            return failure();
+          }
+          conditionOp.getArgsMutable()[i].assign(replacement);
+        }
       }
     }
   }

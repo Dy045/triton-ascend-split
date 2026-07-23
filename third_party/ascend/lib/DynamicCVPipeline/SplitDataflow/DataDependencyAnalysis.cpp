@@ -87,7 +87,8 @@ llvm::StringRef getCoreTypeWithIndex(Operation *op, int index) {
 bool DataDependencyAnalysisPass::isControlFlowOp(mlir::Operation *op) {
   if (!op)
     return false;
-  return isa<scf::ForOp>(op) || isa<scf::IfOp>(op) || isa<scf::YieldOp>(op);
+  return isa<scf::ForOp, scf::WhileOp>(op) || isa<scf::IfOp>(op) ||
+         isa<scf::YieldOp, scf::ConditionOp>(op);
 }
 
 bool DataDependencyAnalysisPass::isCubeOrVectorOp(mlir::Operation *op) {
@@ -317,20 +318,25 @@ DataDependencyAnalysisPass::collectDiffCoreTypeUsers(
   return diffUsers;
 }
 
-// Inserts a producer block at the beginning of the for loop body and records
+// Inserts a producer block at the beginning of loop body and records
 // cross-core-type dependencies for each user in diffUsers.
 void DataDependencyAnalysisPass::insertProducerAndRecordDeps(
-    scf::ForOp forOp, mlir::BlockArgument iterArg, llvm::StringRef initCoreType,
+    mlir::LoopLikeOpInterface loopOp, int iterArgIndex,
+    mlir::BlockArgument loopArg, llvm::StringRef initCoreType,
     llvm::SmallVector<mlir::Operation *> &diffUsers, DataDependencyInfo &info) {
+  (void)iterArgIndex;
   auto &v2cDependencies = info.getV2CDependencies();
   auto &c2vDependencies = info.getC2VDependencies();
   auto &blockInfoMap = info.getBlockInfoMap();
 
   int newId = CVPipeline::getAvailableBlockId(module);
-  OpBuilder builder(forOp);
-  Block &bodyBlock = forOp.getRegion().front();
-  builder.setInsertionPointToStart(&bodyBlock);
-  Location loc = forOp.getLoc();
+  OpBuilder builder(loopOp);
+  Block &targetBlock =
+      isa<scf::WhileOp>(loopOp.getOperation())
+          ? cast<scf::WhileOp>(loopOp.getOperation()).getAfter().front()
+          : cast<scf::ForOp>(loopOp.getOperation()).getRegion().front();
+  builder.setInsertionPointToStart(&targetBlock);
+  Location loc = loopOp.getLoc();
   auto constOp = builder.create<arith::ConstantIntOp>(loc, 0, 32);
   setOpBlockId(constOp, newId);
   setOpCoreType(constOp, initCoreType);
@@ -364,7 +370,7 @@ void DataDependencyAnalysisPass::insertProducerAndRecordDeps(
     // Record dependency
     DependencyInfo depInfo;
     depInfo.type = depType;
-    depInfo.value = iterArg;
+    depInfo.value = loopArg;
     depInfo.iniProducerBlockId = newId;
     depInfo.iniConsumerBlockId = userBlockId;
 
@@ -372,7 +378,7 @@ void DataDependencyAnalysisPass::insertProducerAndRecordDeps(
         findCommonLevelBlockIds(info, newId, userBlockId);
     depInfo.producerBlockId = producerBlockId;
     depInfo.consumerBlockId = consumerBlockId;
-    if (isValid1DValueForDependency(iterArg)) {
+    if (isValid1DValueForDependency(loopArg)) {
       depInfo.is1DTensor = true;
     }
     if (depType == DependencyType::VectorToCube) {
@@ -415,30 +421,39 @@ bool checkYieldCoreType(mlir::Operation *yieldOp) {
   return true;
 }
 
-// Process iterArg dependencies for all scf.for operations in the module.
-// This function iterates through all for loops and checks each iterArg to
-// determine if there are cross-core-type data dependencies.
+// Process iterArg dependencies for all loop-like operations in the module.
 void DataDependencyAnalysisPass::processIterArgDependencies() {
   auto &info = getAnalysis<DataDependencyInfo>();
 
-  // Step1: Collect all scf.for operations in the module
-  llvm::SmallVector<scf::ForOp> forOps;
-  module.walk([&](scf::ForOp forOp) { forOps.push_back(forOp); });
-  LOG_DEBUG("Processing iterArg dependencies, found " << forOps.size()
-                                                      << " scf.for ops\n");
+  llvm::SmallVector<mlir::LoopLikeOpInterface> loopOps;
+  module.walk(
+      [&](mlir::LoopLikeOpInterface loopOp) { loopOps.push_back(loopOp); });
+  LOG_DEBUG("Processing iterArg dependencies, found " << loopOps.size()
+                                                      << " loop ops\n");
 
-  // Step2: Process each iterArg of each scf.for operation
-  for (scf::ForOp forOp : forOps) {
-    size_t numIterArgs = forOp.getInitArgs().size();
-    mlir::Operation *yieldOp = forOp.getBody()->getTerminator();
-    if (!checkYieldCoreType(yieldOp)) {
-      LOG_DEBUG("[ERROR]: Yield core type mismatch defining op\n");
-      signalPassFailure();
+  for (mlir::LoopLikeOpInterface loopOp : loopOps) {
+    bool isWhile = isa<scf::WhileOp>(loopOp.getOperation());
+    size_t numIterArgs = loopOp.getInits().size();
+
+    if (!isWhile) {
+      auto forOp = cast<scf::ForOp>(loopOp.getOperation());
+      mlir::Operation *yieldOp = forOp.getBody()->getTerminator();
+      if (!checkYieldCoreType(yieldOp)) {
+        LOG_DEBUG("[ERROR]: Yield core type mismatch defining op\n");
+        signalPassFailure();
+      }
     }
+
     for (int iterArgIndex = 0; iterArgIndex < numIterArgs; ++iterArgIndex) {
-      mlir::Value initValue = forOp.getInits()[iterArgIndex];
-      mlir::BlockArgument iterArg = forOp.getRegionIterArg(iterArgIndex);
-      mlir::Value yieldedValue = forOp.getYieldedValues()[iterArgIndex];
+      mlir::Value initValue = loopOp.getInits()[iterArgIndex];
+      mlir::BlockArgument iterArg;
+      if (auto forOp = dyn_cast<scf::ForOp>(loopOp.getOperation())) {
+        iterArg = forOp.getRegionIterArg(iterArgIndex);
+      } else {
+        auto whileOp = cast<scf::WhileOp>(loopOp.getOperation());
+        iterArg = whileOp.getAfter().front().getArgument(iterArgIndex);
+      }
+      mlir::Value yieldedValue = loopOp.getYieldedValues()[iterArgIndex];
       LOG_DEBUG("initValue" << initValue << "\n");
       LOG_DEBUG("yieldedValue" << yieldedValue << "\n");
 
@@ -466,7 +481,8 @@ void DataDependencyAnalysisPass::processIterArgDependencies() {
       auto initDefResult = dyn_cast<mlir::OpResult>(initValue);
       auto initCoreType = getCoreTypeWithIndex(
           initDefOp, initDefResult ? initDefResult.getResultNumber() : 0);
-      auto yieldCoreType = getCoreTypeWithIndex(forOp, iterArgIndex);
+      auto yieldCoreType =
+          getCoreTypeWithIndex(loopOp.getOperation(), iterArgIndex);
 
       // Only process if init and yield have matching core types
       // Mismatch indicates a more complex dependency pattern that requires
@@ -484,8 +500,8 @@ void DataDependencyAnalysisPass::processIterArgDependencies() {
 
       auto diffUsers = collectDiffCoreTypeUsers(iterArg, initCoreType);
       if (!diffUsers.empty()) {
-        insertProducerAndRecordDeps(forOp, iterArg, initCoreType, diffUsers,
-                                    info);
+        insertProducerAndRecordDeps(loopOp, iterArgIndex, iterArg, initCoreType,
+                                    diffUsers, info);
       }
     }
   }
