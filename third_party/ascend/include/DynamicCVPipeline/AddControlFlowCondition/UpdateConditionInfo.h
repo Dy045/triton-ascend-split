@@ -147,8 +147,7 @@ private:
                             bool hasCounter, Value counter, Value step);
 
   void populateNewElseBlock(scf::IfOp newIfOp, scf::IfOp oldIfOp,
-                            bool needsYield, bool oldHasElse, bool hasCounter,
-                            Value counter);
+                            bool oldHasElse, bool hasCounter, Value counter);
 
   scf::IfOp
   createNewIfOpWithBlocks(scf::IfOp oldIfOp, Value combinedCond,
