@@ -559,6 +559,10 @@ static UseCheckResult checkConditionUse(OpOperand &use, Operation *owner,
   unsigned idx = use.getOperandNumber();
   if (conditionOp->getParentOp() != owner || idx == 0 || idx != slotIndex + 1) {
     Operation *parentOp = conditionOp->getParentOp();
+    if (parentOp && idx == 0 &&
+        controlFlowOpHasScopeContent(parentOp, scopeType)) {
+      return UseCheckResult::Active;
+    }
     if (parentOp && !matchesScope(parentOp, scopeType)) {
       return UseCheckResult::Continue;
     }

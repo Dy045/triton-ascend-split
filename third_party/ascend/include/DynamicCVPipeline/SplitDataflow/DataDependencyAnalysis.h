@@ -161,8 +161,7 @@ private:
                            llvm::StringRef initCoreType);
   void
   insertProducerAndRecordDeps(mlir::LoopLikeOpInterface loopOp,
-                              int iterArgIndex,
-                              mlir::BlockArgument loopArg,
+                              int iterArgIndex, mlir::BlockArgument loopArg,
                               llvm::StringRef initCoreType,
                               llvm::SmallVector<mlir::Operation *> &diffUsers,
                               DataDependencyInfo &info);

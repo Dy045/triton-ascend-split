@@ -218,7 +218,8 @@ collectOpsByTransferId(ModuleOp module,
 
 /// Collect alloc/mark pairs from transfer ops in the group.
 /// Identifies the correct cross-core buffer (ub/cbuf) used by each transfer op,
-/// ignoring local buffers (cc on CUBE side) that are not part of the data transfer.
+/// ignoring local buffers (cc on CUBE side) that are not part of the data
+/// transfer.
 static int collectBufferAllocs(const SmallVector<Operation *> &ops,
                                TransferGroupInfo &info) {
   // Helper: find the annotation.mark for a given alloc op
@@ -276,7 +277,8 @@ static int collectBufferAllocs(const SmallVector<Operation *> &ops,
 
   // Fill missing side from remaining allocs (prefer allocs with marks)
   for (auto *allocOp : allocs) {
-    if (allocOp == info.senderBuf.allocOp || allocOp == info.receiverBuf.allocOp)
+    if (allocOp == info.senderBuf.allocOp ||
+        allocOp == info.receiverBuf.allocOp)
       continue;
     Operation *mark = findMarkForAlloc(allocOp);
     if (!info.senderBuf.allocOp) {
@@ -288,12 +290,11 @@ static int collectBufferAllocs(const SmallVector<Operation *> &ops,
     }
   }
 
-  LDBG("Sender buffer: " << (info.senderBuf.allocOp ? "alloc" : "none")
-                          << " + "
-                          << (info.senderBuf.markOp ? "mark" : "none"));
+  LDBG("Sender buffer: " << (info.senderBuf.allocOp ? "alloc" : "none") << " + "
+                         << (info.senderBuf.markOp ? "mark" : "none"));
   LDBG("Receiver buffer: " << (info.receiverBuf.allocOp ? "alloc" : "none")
-                            << " + "
-                            << (info.receiverBuf.markOp ? "mark" : "none"));
+                           << " + "
+                           << (info.receiverBuf.markOp ? "mark" : "none"));
   return 0;
 }
 
@@ -843,12 +844,12 @@ static Value ensureWhileOpHasToggle(scf::WhileOp whileOp) {
   newWhile.getAfter().getBlocks().clear();
   SmallVector<Location> beforeLocs(beforeArgTypes.size(), loc);
   SmallVector<Location> afterLocs(afterArgTypes.size(), loc);
-  Block *newBefore = builder.createBlock(&newWhile.getBefore(),
-                                         newWhile.getBefore().end(),
-                                         beforeArgTypes, beforeLocs);
-  Block *newAfter = builder.createBlock(&newWhile.getAfter(),
-                                        newWhile.getAfter().end(),
-                                        afterArgTypes, afterLocs);
+  Block *newBefore =
+      builder.createBlock(&newWhile.getBefore(), newWhile.getBefore().end(),
+                          beforeArgTypes, beforeLocs);
+  Block *newAfter =
+      builder.createBlock(&newWhile.getAfter(), newWhile.getAfter().end(),
+                          afterArgTypes, afterLocs);
 
   // --- Clone before region ---
   IRMapping beforeMap;
@@ -865,7 +866,8 @@ static Value ensureWhileOpHasToggle(scf::WhileOp whileOp) {
   SmallVector<Value> condArgs;
   for (Value arg : oldCond.getArgs())
     condArgs.push_back(beforeMap.lookupOrDefault(arg));
-  Value toggleArgBefore = newBefore->getArgument(newBefore->getNumArguments() - 1);
+  Value toggleArgBefore =
+      newBefore->getArgument(newBefore->getNumArguments() - 1);
   condArgs.push_back(toggleArgBefore);
   Value mappedCond = beforeMap.lookupOrDefault(oldCond.getCondition());
   builder.create<scf::ConditionOp>(loc, mappedCond, condArgs);
@@ -905,8 +907,7 @@ static Value ensureWhileOpHasToggle(scf::WhileOp whileOp) {
   SmallVector<Value> newResults(newWhile.getResults().begin(),
                                 newWhile.getResults().end());
   newResults.pop_back(); // remove the toggle result
-  for (auto [oldRes, newRes] :
-       llvm::zip(whileOp.getResults(), newResults))
+  for (auto [oldRes, newRes] : llvm::zip(whileOp.getResults(), newResults))
     oldRes.replaceAllUsesWith(newRes);
   whileOp->erase();
 
@@ -1291,8 +1292,7 @@ static Value prepareLoopPolling(Operation *loopOp, Operation *waitOp,
 
   if (auto forOp = dyn_cast<scf::ForOp>(loopOp)) {
     OpBuilder condBuilder(forOp.getBody(), Block::iterator(waitOp));
-    Value cond =
-        createPollingCondition(forOp, condBuilder, bid, tid);
+    Value cond = createPollingCondition(forOp, condBuilder, bid, tid);
     builderOut.setInsertionPoint(forOp.getBody()->getTerminator());
     return cond;
   }
@@ -1318,8 +1318,8 @@ static int addPollingControlFlow(DenseMap<int, TransferGroupInfo> &groups) {
 
     // Prepare polling condition and builder for sender loop
     OpBuilder senderBuilder(senderWaitParent->getContext());
-    Value senderCond =
-        prepareLoopPolling(senderWaitParent, g.senderChain.waitOp, senderBuilder);
+    Value senderCond = prepareLoopPolling(senderWaitParent,
+                                          g.senderChain.waitOp, senderBuilder);
 
     // Process sender chain (isProducer=true)
     if (processTransferChain(g.senderChain, senderCond, g.senderInputBuffer,
@@ -1382,8 +1382,7 @@ static void preInjectWhileOpToggles(ModuleOp module) {
   for (auto whileOp : whileOps)
     ensureWhileOpHasToggle(whileOp);
 
-  LDBG("Preprocessed " << whileOps.size()
-                        << " WhileOps with toggle injection");
+  LDBG("Preprocessed " << whileOps.size() << " WhileOps with toggle injection");
 }
 
 // ============================================================================

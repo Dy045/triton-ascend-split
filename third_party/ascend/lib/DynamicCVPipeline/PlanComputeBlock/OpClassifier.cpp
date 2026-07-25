@@ -592,8 +592,8 @@ findIterArgUpstreamOps(Value def,
     Value yieldedValue = yieldOp->getOperand(argIdx - 1);
     Operation *yieldedDef = yieldedValue.getDefiningOp();
     if (yieldedDef && yieldedDef != forOp) {
-      LLVM_DEBUG(DBGS() << "[findIterArgUpstreamOps] yielded def: " << *yieldedDef
-                        << "\n");
+      LLVM_DEBUG(DBGS() << "[findIterArgUpstreamOps] yielded def: "
+                        << *yieldedDef << "\n");
       upstreamOps.push_back(yieldedDef);
     }
     return;
@@ -617,8 +617,8 @@ findIterArgUpstreamOps(Value def,
 
     Operation *initDef = initValue.getDefiningOp();
     if (initDef && initDef != whileOp) {
-      LLVM_DEBUG(DBGS() << "[findIterArgUpstreamOps] while init def: " << *initDef
-                        << "\n");
+      LLVM_DEBUG(DBGS() << "[findIterArgUpstreamOps] while init def: "
+                        << *initDef << "\n");
       upstreamOps.push_back(initDef);
     }
 
@@ -630,8 +630,8 @@ findIterArgUpstreamOps(Value def,
     Value yieldedValue = yieldOp->getOperand(argIdx);
     Operation *yieldedDef = yieldedValue.getDefiningOp();
     if (yieldedDef && yieldedDef != whileOp) {
-      LLVM_DEBUG(DBGS() << "[findIterArgUpstreamOps] while yielded def: " << *yieldedDef
-                        << "\n");
+      LLVM_DEBUG(DBGS() << "[findIterArgUpstreamOps] while yielded def: "
+                        << *yieldedDef << "\n");
       upstreamOps.push_back(yieldedDef);
     }
   }
@@ -805,8 +805,8 @@ void OpClassifierPass::markFillOpsAsCube() {
       outsIsCube = true;
       LLVM_DEBUG(DBGS() << "\tfill outs defined by CUBE op: "
                         << outsDef->getName().getStringRef() << "\n");
-    } else if (!outsDef) { // Case 2: outs is a BlockArgument (scf.for/scf.if/scf.while
-                           // iter_arg)
+    } else if (!outsDef) { // Case 2: outs is a BlockArgument
+                           // (scf.for/scf.if/scf.while iter_arg)
       auto blockArg = dyn_cast<BlockArgument>(outs);
       if (blockArg) {
         Operation *parentOp = blockArg.getOwner()->getParentOp();
@@ -1637,11 +1637,14 @@ int OpClassifierPass::stampToIR() {
       continue;
     OpCoreType coreType = it->second;
 
-    // Skip most scf dialect operations except scf.condition (terminator in while's before region)
-    if (llvm::isa<scf::SCFDialect>(op->getDialect()) && !llvm::isa<scf::ConditionOp>(op))
+    // Skip most scf dialect operations except scf.condition (terminator in
+    // while's before region)
+    if (llvm::isa<scf::SCFDialect>(op->getDialect()) &&
+        !llvm::isa<scf::ConditionOp>(op))
       continue;
 
-    // scf.condition is always VECTOR (it's the condition check in while's before region)
+    // scf.condition is always VECTOR (it's the condition check in while's
+    // before region)
     if (llvm::isa<scf::ConditionOp>(op)) {
       coreType = OP_VECTOR_ONLY;
     }

@@ -849,11 +849,10 @@ scf::ForOp UpdateLoopIterTimesPass::extendForOpIterationCount(
 }
 
 // Update WhileOp condition based on ifblock conditions
-// Uses info->whileBlockArgMap: {WhileOp: {block_id: {new_arg_idx: old_arg_idx}}}
-// For each IfOp in WhileOp, get its block_id
-// Get new args and mapping from info->whileBlockArgMap
-// Copy entire beforeRegion and replace old args with new args
-// Combine all ifblock conditions with OR operation
+// Uses info->whileBlockArgMap: {WhileOp: {block_id: {new_arg_idx:
+// old_arg_idx}}} For each IfOp in WhileOp, get its block_id Get new args and
+// mapping from info->whileBlockArgMap Copy entire beforeRegion and replace old
+// args with new args Combine all ifblock conditions with OR operation
 int UpdateLoopIterTimesPass::UpdateWhileLoopCondition(
     DenseMap<int, SmallVector<Operation *>> &mainLoopIdMap) {
   int ret = 0;
@@ -937,7 +936,8 @@ int UpdateLoopIterTimesPass::UpdateWhileLoopCondition(
         for (Operation *op : opsToClone) {
           Operation *clonedOp = builder.clone(*op, mapper);
 
-          // If this op defines the original condition, get the corresponding result
+          // If this op defines the original condition, get the corresponding
+          // result
           if (op->getResultTypes().size() > 0) {
             for (unsigned i = 0; i < op->getNumResults(); ++i) {
               if (op->getResult(i) == originalCondition) {
@@ -958,8 +958,8 @@ int UpdateLoopIterTimesPass::UpdateWhileLoopCondition(
         if (!combinedCondition) {
           combinedCondition = newCondition;
         } else {
-          combinedCondition =
-              builder.create<arith::OrIOp>(loc, combinedCondition, newCondition);
+          combinedCondition = builder.create<arith::OrIOp>(
+              loc, combinedCondition, newCondition);
         }
 
         return WalkResult::advance();
@@ -1060,8 +1060,7 @@ int UpdateLoopIterTimesPass::GetMainLoopIdToLoopOpMap(
           return mlir::WalkResult::interrupt();
         }
 
-        auto mainLoopId =
-            op->getAttrOfType<IntegerAttr>(CVPipeline::kMainLoop);
+        auto mainLoopId = op->getAttrOfType<IntegerAttr>(CVPipeline::kMainLoop);
         if (mainLoopId) {
           int id = mainLoopId.getInt();
           if (isCube) {
@@ -1202,7 +1201,6 @@ int UpdateLoopIterTimesPass::UpdateForLoopIteration(
                                     maxRequiredBuffers, maxX, infoMap);
     if (ret != 0)
       return -1;
-
 
     // Update all loops with this id using the same max values
     for (Operation *loopOp : sameIdForOps) {
