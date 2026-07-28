@@ -89,41 +89,6 @@ static std::optional<int> getIfBlockId(scf::IfOp ifOp) {
   return static_cast<int>(attr.getInt());
 }
 
-// Constant with the same type as `type` (iN or index). Avoids arith.cmpi/addi
-// failures when control vars are i64/index but constants were hardcoded i32.
-static Value createConstLike(OpBuilder &builder, Location loc, int64_t value,
-                             Type type) {
-  if (isa<IndexType>(type))
-    return builder.create<arith::ConstantIndexOp>(loc, value);
-  if (isa<IntegerType>(type))
-    return builder.create<arith::ConstantOp>(loc, IntegerAttr::get(type, value));
-  LDBG("createConstLike unsupported type: " << type << "\n");
-  return Value();
-}
-
-// Cast integer/index value to destType for use in cmpi/addi with mismatched
-// loop args (e.g. before i64 vs after/latest i32).
-static Value castIntLike(OpBuilder &builder, Location loc, Value value,
-                         Type destType) {
-  Type srcType = value.getType();
-  if (srcType == destType)
-    return value;
-  if (isa<IndexType>(srcType) || isa<IndexType>(destType))
-    return builder.create<arith::IndexCastOp>(loc, destType, value);
-  auto srcInt = dyn_cast<IntegerType>(srcType);
-  auto dstInt = dyn_cast<IntegerType>(destType);
-  if (!srcInt || !dstInt) {
-    LDBG("castIntLike unsupported types: " << srcType << " -> " << destType
-                                           << "\n");
-    return Value();
-  }
-  if (srcInt.getWidth() < dstInt.getWidth())
-    return builder.create<arith::ExtSIOp>(loc, destType, value);
-  if (srcInt.getWidth() > dstInt.getWidth())
-    return builder.create<arith::TruncIOp>(loc, destType, value);
-  return value;
-}
-
 // for: body region iter args; while-do: after-region args.
 static int getLoopRegionIterArgs(Operation *loopOp,
                                  MutableArrayRef<BlockArgument> &outArgs) {
@@ -189,8 +154,6 @@ static int cloneConditionDefChain(Value value, Region &beforeRegion,
     if (cloneConditionDefChain(operand, beforeRegion, mapping, builder,
                                remappedOperand) == UPDATE_CONDITION_INFO_FAILED)
       return UPDATE_CONDITION_INFO_FAILED;
-    if (!mapping.lookupOrNull(operand))
-      mapping.map(operand, remappedOperand);
   }
 
   Operation *cloned = builder.clone(*defOp, mapping);
@@ -240,16 +203,7 @@ static int buildWhileCounterCondition(
     auto latestIt = controlVarToLatestValue.find(afterArg);
     if (latestIt != controlVarToLatestValue.end())
       afterArg = latestIt->second;
-    Value beforeArg = beforeArgs[oldArgIdx];
-    if (afterArg.getType() != beforeArg.getType()) {
-      afterArg =
-          castIntLike(builder, ifOp.getLoc(), afterArg, beforeArg.getType());
-      if (!afterArg) {
-        LDBG("Failed to cast whileBlockArgMap value to before-arg type\n");
-        return UPDATE_CONDITION_INFO_FAILED;
-      }
-    }
-    mapping.map(beforeArg, afterArg);
+    mapping.map(beforeArgs[oldArgIdx], afterArg);
   }
 
   // Only take condition value x from scf.condition(x, ...); do not clone the
@@ -966,6 +920,8 @@ void UpdateConditionInfoPass::collectIntraCoreInputConditions(
   }
 
   size_t beforeConditionNum = conditions.size();
+  Value zeroConst =
+      builder.create<arith::ConstantIntOp>(loc, 0, CONST_INT_TYPE);
   for (int idx : intraCoreInputValues) {
     auto varIt = idxToVar.find(idx);
     if (varIt == idxToVar.end()) {
@@ -981,14 +937,8 @@ void UpdateConditionInfoPass::collectIntraCoreInputConditions(
       varToUse = latestIt->second;
     }
 
-    Value zeroForVar = createConstLike(builder, loc, 0, varToUse.getType());
-    if (!zeroForVar) {
-      LDBG("Failed to create zero const for intraCore input var type "
-           << varToUse.getType() << "\n");
-      continue;
-    }
     Value cond = builder.create<arith::CmpIOp>(loc, arith::CmpIPredicate::sgt,
-                                               varToUse, zeroForVar);
+                                               varToUse, zeroConst);
     conditions.push_back(cond);
     usedVarsSet.insert(var);
     varUpdateTypes[var] = VarUpdateType::DEC;
@@ -1019,6 +969,8 @@ int UpdateConditionInfoPass::collectIntraCoreOutputConditions(
   }
   for (auto &group : outputGroups) {
     int size = group.outputs.size();
+    Value limitVal =
+        builder.create<arith::ConstantIntOp>(loc, size, CONST_INT_TYPE);
     for (Value var : group.inputVars) {
       Value varToUse = var;
       auto latestIt = controlVarToLatestValue.find(var);
@@ -1026,12 +978,6 @@ int UpdateConditionInfoPass::collectIntraCoreOutputConditions(
         varToUse = latestIt->second;
       }
 
-      Value limitVal = createConstLike(builder, loc, size, varToUse.getType());
-      if (!limitVal) {
-        LDBG("Failed to create limit const for intraCore output var type "
-             << varToUse.getType() << "\n");
-        return UPDATE_CONDITION_INFO_FAILED;
-      }
       Value cond = builder.create<arith::CmpIOp>(loc, arith::CmpIPredicate::slt,
                                                  varToUse, limitVal);
       conditions.push_back(cond);
@@ -1142,9 +1088,8 @@ void UpdateConditionInfoPass::collectTensorIterArgInputConditions(
       varToUse = latestIt->second;
     }
 
-    Value oneConst = createConstLike(builder, loc, 1, varToUse.getType());
-    if (!oneConst)
-      continue;
+    Value oneConst =
+        builder.create<arith::ConstantIntOp>(loc, 1, CONST_INT_TYPE);
     Value cond = builder.create<arith::CmpIOp>(loc, arith::CmpIPredicate::eq,
                                                varToUse, oneConst);
     conditions.push_back(cond);
@@ -1171,9 +1116,8 @@ void UpdateConditionInfoPass::collectTensorIterArgOutputConditions(
       varToUse = latestIt->second;
     }
 
-    Value zeroConst = createConstLike(builder, loc, 0, varToUse.getType());
-    if (!zeroConst)
-      continue;
+    Value zeroConst =
+        builder.create<arith::ConstantIntOp>(loc, 0, CONST_INT_TYPE);
     Value cond = builder.create<arith::CmpIOp>(loc, arith::CmpIPredicate::eq,
                                                varToUse, zeroConst);
     conditions.push_back(cond);
@@ -1285,12 +1229,8 @@ int UpdateConditionInfoPass::setFlowOptCondition(scf::IfOp currentIfOp,
   int optInt =
       std::min(info->intraCoreBufferCount - 1, info->crossCoreBufferCount);
 
-  Value optNum = createConstLike(builder, loc, optInt, step.getType());
-  if (!optNum) {
-    LDBG("Failed to create flowOpt optNum with step type " << step.getType()
-                                                           << "\n");
-    return UPDATE_CONDITION_INFO_FAILED;
-  }
+  Value optNum =
+      builder.create<arith::ConstantIntOp>(loc, optInt, CONST_INT_TYPE);
   Value optOffset = builder.create<arith::MulIOp>(loc, step, optNum);
   Value lowerPlusOffset =
       builder.create<arith::AddIOp>(loc, lowerBound, optOffset);
@@ -1365,12 +1305,9 @@ void UpdateConditionInfoPass::updateControlVarToLatestValue(scf::IfOp newIfOp,
   LDBG("[DEBUG] controlVarToLatestValue size: "
        << controlVarToLatestValue.size() << "\n");
 
-  // Print types only: streaming OpResult may dump the whole scf.if and interleave
-  // with the next if's create errors, which looks like the print itself failed.
   for (auto &entry : controlVarToLatestValue) {
-    LDBG("[DEBUG]   key type = " << entry.first.getType()
-                                 << "  -->  new value type = "
-                                 << entry.second.getType() << "\n");
+    LDBG("[DEBUG]   key = " << entry.first
+                            << "  -->  new value = " << entry.second << "\n");
   }
 }
 
@@ -1542,6 +1479,8 @@ void UpdateConditionInfoPass::populateNewThenBlock(
   SmallVector<Value> thenYieldOperands(oldYieldOperands.begin(),
                                        oldYieldOperands.end());
   if (!currentUsedVars.empty()) {
+    Value one =
+        thenBuilder.create<arith::ConstantIntOp>(loc, 1, CONST_INT_TYPE);
     for (Value var : currentUsedVars) {
       Value varToUse = var;
       auto latestIt = controlVarToLatestValue.find(var);
@@ -1552,12 +1491,6 @@ void UpdateConditionInfoPass::populateNewThenBlock(
       Value yieldVal = varToUse;
       auto it = varUpdateTypes.find(var);
       if (it != varUpdateTypes.end()) {
-        Value one = createConstLike(thenBuilder, loc, 1, varToUse.getType());
-        if (!one) {
-          LDBG("Failed to create one const for control var type "
-               << varToUse.getType() << "\n");
-          continue;
-        }
         if (it->second == VarUpdateType::DEC) {
           yieldVal = thenBuilder.create<arith::SubIOp>(loc, varToUse, one);
         } else if (it->second == VarUpdateType::INC) {
@@ -1755,14 +1688,6 @@ int UpdateConditionInfoPass::combineConditions(
     auto latestIt = controlVarToLatestValue.find(counter);
     if (latestIt != controlVarToLatestValue.end()) {
       counterToUse = latestIt->second;
-    }
-    if (counterToUse.getType() != upperBound.getType()) {
-      counterToUse =
-          castIntLike(condBuilder, loc, counterToUse, upperBound.getType());
-      if (!counterToUse) {
-        LDBG("Failed to cast counter to upperBound type for cmpi\n");
-        return UPDATE_CONDITION_INFO_FAILED;
-      }
     }
     Value counterCond = condBuilder.create<arith::CmpIOp>(
         loc, arith::CmpIPredicate::slt, counterToUse, upperBound);
