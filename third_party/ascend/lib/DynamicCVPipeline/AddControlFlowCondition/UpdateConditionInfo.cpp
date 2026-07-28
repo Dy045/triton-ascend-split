@@ -154,6 +154,8 @@ static int cloneConditionDefChain(Value value, Region &beforeRegion,
     if (cloneConditionDefChain(operand, beforeRegion, mapping, builder,
                                remappedOperand) == UPDATE_CONDITION_INFO_FAILED)
       return UPDATE_CONDITION_INFO_FAILED;
+    if (!mapping.lookupOrNull(operand))
+      mapping.map(operand, remappedOperand);
   }
 
   Operation *cloned = builder.clone(*defOp, mapping);
