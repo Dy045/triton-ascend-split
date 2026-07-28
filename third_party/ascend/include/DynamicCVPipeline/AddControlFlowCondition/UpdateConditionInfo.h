@@ -71,18 +71,18 @@ private:
                                   scf::ForOp oldForOp, scf::ForOp newForOp,
                                   IRMapping &mapper);
 
-  Value getVarValue(scf::ForOp forOp, int varIndex);
+  Value getVarValue(Operation *loopOp, int varIndex);
 
   void collectDependencyBuffers(
-      ModuleOp module, SmallVector<scf::ForOp> &mainLoopForOps,
+      ModuleOp module, SmallVector<Operation *> &mainLoopOps,
       DenseMap<int, DenseMap<Operation *, SmallVector<Operation *>>>
           &crossCoreBuffers,
-      DenseMap<scf::ForOp,
+      DenseMap<Operation *,
                DenseMap<int, DenseMap<Operation *, SmallVector<Operation *>>>>
           &intraCoreBuffersMap);
 
   int buildIdxToVarMap(
-      scf::ForOp forOp,
+      Operation *loopOp,
       const DenseMap<int, DenseMap<Operation *, SmallVector<Operation *>>>
           &intraCoreBuffers,
       DenseMap<int, Value> &idxToVar);
@@ -120,7 +120,7 @@ private:
       DenseMap<Value, VarUpdateType> &varUpdateTypes);
 
   // Build the ifOp variable mapping for the tensor iter_args
-  int buildTensorIterArgIfOpVarMap(scf::ForOp forOp);
+  int buildTensorIterArgIfOpVarMap(Operation *loopOp);
 
   // Collect the consumption conditions of the tensor iter_args consumer
   void collectTensorIterArgInputConditions(
@@ -147,8 +147,7 @@ private:
                             bool hasCounter, Value counter, Value step);
 
   void populateNewElseBlock(scf::IfOp newIfOp, scf::IfOp oldIfOp,
-                            bool needsYield, bool oldHasElse, bool hasCounter,
-                            Value counter);
+                            bool oldHasElse, bool hasCounter, Value counter);
 
   scf::IfOp
   createNewIfOpWithBlocks(scf::IfOp oldIfOp, Value combinedCond,
@@ -168,9 +167,13 @@ private:
 
   int updateForOpYield(scf::ForOp forOp);
 
+  // Update after-region yield for while when control vars were rewritten.
+  int updateWhileOpYield(scf::WhileOp whileOp);
+
+  // loopOp is scf.for or scf.while main_loop.
   int combineConditions(ModuleOp module, Value crossCoreCond,
                         Value intraCoreCond, Value flowOptCond, scf::IfOp ifOp,
-                        scf::ForOp forOp, size_t &usedCounterNum,
+                        Operation *loopOp, size_t &usedCounterNum,
                         DenseMap<Value, VarUpdateType> &varUpdateTypes);
 
   int setCrossCoreCondition(
