@@ -1,6 +1,6 @@
-// RUN: triton-opt --update-for-ops %s --allow-unregistered-dialect | FileCheck %s
+// RUN: triton-opt --update-loop-ops %s --allow-unregistered-dialect | FileCheck %s
 
-// Test update-for-ops pass adds iter_args for block counters, inner dependency conditions and inserts PIPE_S sync
+// Test update-loop-ops pass adds iter_args for block counters, inner dependency conditions and inserts PIPE_S sync
 // CHECK: func.func @test_update_for_ops
 module attributes {hacc.target = #hacc.target<"Ascend950PR_9579">} {
   func.func @test_update_for_ops(%arg0: memref<?xi8>, %arg1: memref<?xi8>, %arg2: memref<?xf16> {tt.divisibility = 16 : i32, tt.tensor_kind = 0 : i32}, %arg3: memref<?xf16> {tt.divisibility = 16 : i32, tt.tensor_kind = 0 : i32}, %arg4: memref<?xf16> {tt.divisibility = 16 : i32, tt.tensor_kind = 0 : i32}, %arg5: memref<?xf32> {tt.divisibility = 16 : i32}, %arg6: memref<?xf32> {tt.divisibility = 16 : i32, tt.tensor_kind = 1 : i32}, %arg7: memref<?xf16> {tt.divisibility = 16 : i32, tt.tensor_kind = 1 : i32}, %arg8: memref<?xi32> {tt.divisibility = 16 : i32}, %arg9: i32, %arg10: i32, %arg11: i32, %arg12: i32, %arg13: i32, %arg14: i32, %arg15: i32) attributes {SyncBlockLockArgIdx = 0 : i64, WorkspaceArgIdx = 1 : i64, global_kernel = "local", mix_mode = "mix", parallel_mode = "simd"} {

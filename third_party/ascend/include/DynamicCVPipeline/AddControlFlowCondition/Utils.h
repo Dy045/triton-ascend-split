@@ -32,18 +32,20 @@
 namespace mlir {
 namespace triton {
 
-// Attribute names for DynamicCV pipeline
-inline constexpr llvm::StringLiteral kSSBufferIfAttr = "ssbuffer.if";
-inline constexpr llvm::StringLiteral kHIVMMatmulLimitedInCubeAttr =
-    "hivm.matmul_limited_in_cube";
-
 // Collect all nested ops within an operation's regions
 LogicalResult collectAllNestedOps(Operation *op,
                                   llvm::DenseSet<Operation *> &regionOps);
 
-// Group operations by their block_id attribute
+// Returns the body block (single block of loop body ops + scf.yield
+// terminator) of a main-loop op (scf.for or scf.while). Returns nullptr
+// if `op` is neither.
+Block *getMainLoopBodyBlock(Operation *op);
+
+// Group operations by their block_id attribute. `op` must be a main-loop
+// op (scf.for or scf.while) carrying ssbuffer.main_loop. Returns failure
+// otherwise.
 LogicalResult
-collectOpsByBlockId(scf::ForOp forOp,
+collectOpsByBlockId(Operation *op,
                     llvm::DenseMap<int, SmallVector<Operation *>> &blockOps);
 
 // Topological sort of operations based on operand dependencies
@@ -53,11 +55,18 @@ LogicalResult topologicalSort(llvm::DenseSet<Operation *> &ops,
 
 LogicalResult topologicalSort(SmallVector<Operation *> &ops);
 
-// Get block_ids in order of appearance in for loop body
-SmallVector<int> getBlockIdsInOrder(scf::ForOp forOp);
+// Get block_ids in order of appearance in the main-loop body (forOp body
+// or whileOp after-region body). Returns empty if `op` is neither.
+SmallVector<int> getBlockIdsInOrder(Operation *op);
 
-// Get the block_id of the immediate child of scf.for that contains op
-std::optional<int> getForDirectChildBlockId(Operation *op);
+// Count unique ssbuffer.if values inside a main-loop op (scf.for or scf.while
+// carrying ssbuffer.main_loop), walking all nested ops. Returns 0 if none.
+int countUniqueIfBlockIds(Operation *loopOp);
+
+// Get the block_id of the immediate child of the main-loop (scf.for or
+// scf.while carrying ssbuffer.main_loop) that contains op. For scf.while,
+// "body" means the after-region block.
+std::optional<int> getLoopDirectChildBlockId(Operation *op);
 
 // Find the tcb group id that contains value v
 int findTcbGroupId(
