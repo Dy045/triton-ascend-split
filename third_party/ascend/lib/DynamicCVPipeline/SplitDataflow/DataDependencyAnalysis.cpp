@@ -331,11 +331,8 @@ void DataDependencyAnalysisPass::insertProducerAndRecordDeps(
 
   int newId = CVPipeline::getAvailableBlockId(module);
   OpBuilder builder(loopOp);
-  Block &targetBlock =
-      isa<scf::WhileOp>(loopOp.getOperation())
-          ? cast<scf::WhileOp>(loopOp.getOperation()).getAfter().front()
-          : cast<scf::ForOp>(loopOp.getOperation()).getRegion().front();
-  builder.setInsertionPointToStart(&targetBlock);
+  CVPipeline::MainLoop loop = CVPipeline::MainLoop::get(loopOp.getOperation());
+  builder.setInsertionPointToStart(loop.getBody());
   Location loc = loopOp.getLoc();
   auto constOp = builder.create<arith::ConstantIntOp>(loc, 0, 32);
   setOpBlockId(constOp, newId);
@@ -397,16 +394,17 @@ void DataDependencyAnalysisPass::insertProducerAndRecordDeps(
   }
 }
 
-bool checkYieldCoreType(mlir::Operation *yieldOp) {
-  if (!isa<scf::YieldOp>(yieldOp)) {
+static bool checkLoopYieldCoreType(scf::YieldOp yieldOp) {
+  if (!yieldOp) {
     return false;
   }
-  for (unsigned index = 0; index < yieldOp->getNumOperands(); ++index) {
-    mlir::Value value = yieldOp->getOperand(index);
+  for (unsigned index = 0; index < yieldOp.getNumOperands(); ++index) {
+    mlir::Value value = yieldOp.getOperand(index);
     llvm::StringRef yieldCoreType = getCoreTypeWithIndex(yieldOp, index);
 
     mlir::Operation *definingOp = value.getDefiningOp();
-    if (!definingOp || !isa<scf::ForOp>(definingOp)) {
+    if (!definingOp ||
+        !isa<scf::ForOp, scf::WhileOp>(definingOp)) {
       continue;
     }
     auto defResult = dyn_cast<mlir::OpResult>(value);
@@ -432,27 +430,37 @@ void DataDependencyAnalysisPass::processIterArgDependencies() {
                                                       << " loop ops\n");
 
   for (mlir::LoopLikeOpInterface loopOp : loopOps) {
-    bool isWhile = isa<scf::WhileOp>(loopOp.getOperation());
-    size_t numIterArgs = loopOp.getInits().size();
+    Operation *loopOperation = loopOp.getOperation();
+    if (!isa<scf::ForOp, scf::WhileOp>(loopOperation)) {
+      continue;
+    }
 
-    if (!isWhile) {
-      auto forOp = cast<scf::ForOp>(loopOp.getOperation());
-      mlir::Operation *yieldOp = forOp.getBody()->getTerminator();
-      if (!checkYieldCoreType(yieldOp)) {
-        LOG_DEBUG("[ERROR]: Yield core type mismatch defining op\n");
-        signalPassFailure();
-      }
+    size_t numIterArgs = loopOp.getInits().size();
+    CVPipeline::MainLoop loop = CVPipeline::MainLoop::get(loopOperation);
+    scf::YieldOp yieldOp =
+        CVPipeline::MainLoop::getLoopYieldOp(loopOperation);
+    if (!yieldOp) {
+      LOG_DEBUG("[ERROR]: Expected loop to terminate with scf.yield\n");
+      CVPipeline::setFallbackAttr(module, CVPipeline::ERRCODE_FAILED);
+      return;
+    }
+    if (!checkLoopYieldCoreType(yieldOp)) {
+      LOG_DEBUG("[ERROR]: Yield core type mismatch defining op\n");
+      CVPipeline::setFallbackAttr(module, CVPipeline::ERRCODE_FAILED);
+      return;
+    }
+
+    SmallVector<Value> iterArgs = loop.getIterArgs();
+    if (iterArgs.size() != numIterArgs) {
+      LOG_DEBUG("[ERROR]: Loop iter_arg count does not match init count\n");
+      CVPipeline::setFallbackAttr(module, CVPipeline::ERRCODE_FAILED);
+      return;
     }
 
     for (int iterArgIndex = 0; iterArgIndex < numIterArgs; ++iterArgIndex) {
       mlir::Value initValue = loopOp.getInits()[iterArgIndex];
-      mlir::BlockArgument iterArg;
-      if (auto forOp = dyn_cast<scf::ForOp>(loopOp.getOperation())) {
-        iterArg = forOp.getRegionIterArg(iterArgIndex);
-      } else {
-        auto whileOp = cast<scf::WhileOp>(loopOp.getOperation());
-        iterArg = whileOp.getAfter().front().getArgument(iterArgIndex);
-      }
+      mlir::BlockArgument iterArg =
+          cast<mlir::BlockArgument>(iterArgs[iterArgIndex]);
       mlir::Value yieldedValue = loopOp.getYieldedValues()[iterArgIndex];
       LOG_DEBUG("initValue" << initValue << "\n");
       LOG_DEBUG("yieldedValue" << yieldedValue << "\n");
@@ -858,6 +866,9 @@ void DataDependencyAnalysisPass::runOnOperation() {
 
   // Step 2: Analyze iter_args dependencies
   processIterArgDependencies();
+  if (CVPipeline::hasFallbackAttr(module)) {
+    return;
+  }
 
   // Step 3: Analyze dependencies (populate v2c, c2v lists)
   analyzeExternalInputs(info);

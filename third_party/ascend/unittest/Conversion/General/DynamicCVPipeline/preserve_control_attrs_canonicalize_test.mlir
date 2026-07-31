@@ -45,7 +45,7 @@ module {
 // -----
 
 // CHECK-LABEL: "func.func"() <{{.*}}sym_name = "if_attr_survives_unused_result_canonicalize"
-// CHECK-DAG: "arith.select"
+// CHECK-DAG: "arith.select"{{.*}}ssbuffer.block_id = 11 : i32
 // CHECK-DAG: "scf.if"
 // CHECK: }) {hivm.unlikely_condition, ssbuffer.block_id = 11 : i32} : (i1) -> ()
 

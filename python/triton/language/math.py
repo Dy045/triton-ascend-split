@@ -21,8 +21,12 @@ def _check_dtype(dtypes: List[str]) -> T:
             # concatenate args and kwargs
             all_args = list(args) + list(kwargs.values())
             for arg in [a for a in all_args if isinstance(a, core.tensor)]:
-                if arg.type.scalar.name not in dtypes:
-                    raise ValueError(f"Expected dtype {dtypes} but got {arg.type.scalar.name}")
+                arg_type = arg.type.scalar.name
+                if hasattr(arg, 'was_bool_to_int8') and arg.was_bool_to_int8:
+                    # In Triton, int1 maps to the boolean type
+                    arg_type = 'int1'
+                if arg_type not in dtypes:
+                    raise ValueError(f"Expected dtype {dtypes} but got {arg_type}")
             return fn(*args, **kwargs)
 
         return check

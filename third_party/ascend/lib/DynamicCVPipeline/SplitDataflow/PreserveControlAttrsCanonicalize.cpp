@@ -66,13 +66,14 @@ public:
 
   void notifyOperationReplaced(Operation *op, Operation *newOp) override {
     transferAttrs(op, newOp);
+    transferBlockIdToInsertedReplacement(op, newOp);
   }
 
   void notifyOperationReplaced(Operation *op, ValueRange values) override {
     if (Operation *newOp = findReplacementOp(op, values)) {
       transferAttrs(op, newOp);
-      return;
     }
+    transferBlockIdToInsertedReplacementDefs(op, values);
   }
 
 private:
@@ -116,6 +117,38 @@ private:
       if (to->hasAttr(attr.getName()))
         continue;
       to->setAttr(attr.getName(), attr.getValue());
+    }
+  }
+
+  void transferBlockIdToInsertedReplacement(Operation *from,
+                                            Operation *to) const {
+    if (!from || !to || from == to || !isTrackedControlFlowOp(from))
+      return;
+
+    Attribute blockId = from->getAttr(CVPipeline::kBlockId);
+    if (!blockId || to->hasAttr(CVPipeline::kBlockId))
+      return;
+
+    if (!recentInserts.contains(to) || from->getBlock() != to->getBlock())
+      return;
+
+    to->setAttr(CVPipeline::kBlockId, blockId);
+  }
+
+  void transferBlockIdToInsertedReplacementDefs(Operation *from,
+                                                ValueRange replacements) const {
+    if (!from || !isTrackedControlFlowOp(from))
+      return;
+
+    for (Value value : replacements) {
+      if (!value)
+        continue;
+
+      Operation *defOp = value.getDefiningOp();
+      if (!defOp)
+        continue;
+
+      transferBlockIdToInsertedReplacement(from, defOp);
     }
   }
 
