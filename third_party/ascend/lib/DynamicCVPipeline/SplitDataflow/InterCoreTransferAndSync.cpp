@@ -695,8 +695,7 @@ Operation *InterCoreTransferAndSyncPass::insertCubeToVectorTransfer(
       loc, mlir::TypeRange{},    // No return value
       srcValue,                  // src
       cubeAllocOp->getResult(0), // dst
-      mlir::ValueRange{}, dmaModeAttr, nullptr, nullptr, nullptr, nullptr,
-      nullptr, mlir::ArrayAttr{}, nullptr);
+      dmaModeAttr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
   attachTransferTags(fixpipeOp, cubeBlockId, "CUBE", transferIndex);
   attachCrossCoreDeps(fixpipeOp, transferIndex, CVPipeline::crossCoreProducerId,
                       builder);
@@ -801,14 +800,20 @@ InterCoreTransferAndSyncPass::getTransferPipeConfig(Operation *transferOp,
   return config;
 }
 
-// Check if a value fixpiped to ub is directly connected to a storage op
-// Skip ViewLikeOpInterface and ExtractSliceOp during traversal
+// Check if a value fixpiped to UB reaches a store without real VECTOR compute.
 bool InterCoreTransferAndSyncPass::isStoreDirectlyInUserChain(
     Value toTensorValue) {
-  // Traverse user chain starting from toTensorValue
   llvm::SmallVector<Value> workList = {toTensorValue};
   llvm::DenseSet<Value> visited;
   bool hasStore = false;
+  auto enqueueResults = [&](Operation *op) {
+    for (Value result : op->getResults()) {
+      if (!visited.count(result)) {
+        workList.push_back(result);
+      }
+    }
+  };
+
   while (!workList.empty()) {
     Value currVal = workList.pop_back_val();
     if (visited.count(currVal)) {
@@ -817,23 +822,63 @@ bool InterCoreTransferAndSyncPass::isStoreDirectlyInUserChain(
     visited.insert(currVal);
 
     for (Operation *user : currVal.getUsers()) {
-      // Check if user is a storage op
       if (CVPipeline::isStoreLike(user)) {
         hasStore = true;
         continue;
       }
 
-      // Check if user is in skip range
-      if (CVPipeline::isViewLike(user) || CVPipeline::isZeroAdd(user) || user->hasAttr(CVPipeline::kForMayNotExec)) {
-        // Continue traversing through skip ops
-        for (Value result : user->getResults()) {
-          if (!visited.count(result)) {
-            workList.push_back(result);
-          }
-        }
-      } else {
-        return false;
+      if (CVPipeline::isViewLike(user)) {
+        enqueueResults(user);
+        continue;
       }
+
+      if (auto fill = dyn_cast<linalg::FillOp>(user)) {
+        if (fill->getNumResults() != 1 || fill.getOutputs().size() != 1 ||
+            fill.getOutputs()[0] != currVal ||
+            !CVPipeline::isZeroFillValue(fill.getResult(0))) {
+          return false;
+        }
+        enqueueResults(user);
+        continue;
+      }
+
+      if (auto select = dyn_cast<arith::SelectOp>(user)) {
+        Value trueValue = select.getTrueValue();
+        Value falseValue = select.getFalseValue();
+        if (currVal != trueValue && currVal != falseValue) {
+          return false;
+        }
+
+        Value otherValue = currVal == trueValue ? falseValue : trueValue;
+        if (otherValue != toTensorValue &&
+            !CVPipeline::isZeroFillValue(otherValue)) {
+          return false;
+        }
+        enqueueResults(user);
+        continue;
+      }
+
+      if (isa<arith::AddFOp, arith::AddIOp>(user)) {
+        if (!user->hasAttr(CVPipeline::kAddFromMatmul) ||
+            user->getNumOperands() != 2) {
+          return false;
+        }
+
+        Value lhs = user->getOperand(0);
+        Value rhs = user->getOperand(1);
+        if (currVal != lhs && currVal != rhs) {
+          return false;
+        }
+
+        Value otherValue = currVal == lhs ? rhs : lhs;
+        if (!CVPipeline::isZeroFillValue(otherValue)) {
+          return false;
+        }
+        enqueueResults(user);
+        continue;
+      }
+
+      return false;
     }
   }
   return hasStore;
