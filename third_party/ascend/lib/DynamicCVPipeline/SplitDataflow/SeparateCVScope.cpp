@@ -353,7 +353,8 @@ static bool canSkipForwardingUse(OpOperand &use, StringRef scopeType) {
     }
     unsigned resultIndex = operandIndex - kForOpOperandPrefixCount;
     return resultIndex < forOp.getNumResults() &&
-           info->getResultType(resultIndex) != scopeType;
+           info->getResultType(resultIndex) != scopeType &&
+           !needsLoopCarryPreserve(forOp, resultIndex, scopeType);
   }
 
   if (auto whileOp = dyn_cast<scf::WhileOp>(user)) {
@@ -367,7 +368,9 @@ static bool canSkipForwardingUse(OpOperand &use, StringRef scopeType) {
     if (needsLoopCarryPreserve(whileOp, slotIdx, scopeType)) {
       return false;
     }
-    return true;
+    return llvm::none_of(whileOp->getUsers(), [&](Operation *user) {
+      return matchesScope(user, scopeType);
+    });
   }
   return false;
 }
@@ -809,6 +812,15 @@ static LogicalResult neutralizeTerminatorUses(Operation *op,
 static LogicalResult executeActions(SmallVector<PendingAction> &actions,
                                     StringRef scopeType);
 
+static Operation *findLiveResultUser(Operation *op, StringRef scopeType) {
+  for (Value result : op->getResults()) {
+    if (Operation *user = findLiveUser(result, scopeType)) {
+      return user;
+    }
+  }
+  return nullptr;
+}
+
 static LogicalResult normalizeRegionOp(Operation *op, StringRef scopeType) {
   auto infoOpt = parseCoreTypeInfo(op);
   if (!infoOpt) {
@@ -826,6 +838,19 @@ static LogicalResult normalizeRegionOp(Operation *op, StringRef scopeType) {
   Location loc = op->getLoc();
 
   debugDumpOperation("before normalizeRegionOp", op);
+
+  // Keep a loop intact when its body has no op for this scope but its results
+  // are still consumed here; neutralizing carried values would change them.
+  if (isa<scf::ForOp, scf::WhileOp>(op) &&
+      !controlFlowOpHasScopeContent(op, scopeType)) {
+    if (Operation *resultUser = findLiveResultUser(op, scopeType)) {
+      logDebug("preserving complete loop '", op->getName().getStringRef(),
+               "' in scope ", scopeType,
+               " because its result still has live user '",
+               resultUser->getName().getStringRef(), "'");
+      return success();
+    }
+  }
 
   if (op->getNumRegions() > 0) {
     if (failed(neutralizeRegionTerminators(op, info, scopeType, loc))) {
