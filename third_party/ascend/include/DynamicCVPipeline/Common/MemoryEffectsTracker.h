@@ -64,6 +64,7 @@ private:
 
   struct Snapshot {
     SmallVector<MemSlot> states;
+    Operation *lastUnknownOp = nullptr;
   };
 
   void analyzeOp(Operation *op);
@@ -110,6 +111,7 @@ private:
   DenseMap<Operation *, SmallVector<Operation *>> execAfter;
 
   SmallVector<std::unique_ptr<MemSlot>> slots;
+  Operation *lastUnknownOp = nullptr;
   DenseMap<Value, MemSlot *> valueToSlot;
 
   // Per-block sync walls
