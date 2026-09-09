@@ -56,6 +56,16 @@ static bool isFusableOp(Operation *op) {
   if (CVPipeline::isSyncOp(op)) {
     return false;
   }
+  // A vector-only control-flow op nested in mixed CUBE/VECTOR control flow can
+  // carry memory dependencies from an unrelated vector chain.  Treat it as a
+  // boundary here and plan its regions separately; otherwise the two chains
+  // may receive one block id and become impossible to split again without a
+  // scheduling cycle.
+  if (llvm::isa<RegionBranchOpInterface>(op) &&
+      getCoreTypeOfSimpleOpOrCf(op->getParentOp()) ==
+          CoreType::CUBE_AND_VECTOR) {
+    return false;
+  }
   if (isVectorSimpleOpOrCf(op)) {
     // skip terminators
     if (op->getBlock()->mightHaveTerminator() &&
