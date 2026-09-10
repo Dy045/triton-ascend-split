@@ -677,6 +677,176 @@ collectMergeCandidates(int smallBlockId, Block *block,
   return candidates;
 }
 
+static bool isTerminatorInBlock(Operation *op, Block *block) {
+  return block->mightHaveTerminator() && op == block->getTerminator();
+}
+
+static bool isMergeableVectorBlockOp(Operation *op,
+                                     CVPipeline::ComputeBlockIdManager &bm) {
+  return bm.getBlockIdByOp(op) != -1 &&
+         CVPipeline::getOpCoreType(op) == CVPipeline::CoreType::VECTOR_ONLY;
+}
+
+static void
+collectDownstreamBlockIds(int smallBlockId, Block *block,
+                          CVPipeline::ComputeBlockIdManager &bm,
+                          llvm::ArrayRef<Operation *> ops,
+                          const CVPipeline::MemoryDependenceGraph &memGraph,
+                          llvm::SmallDenseSet<int> &downBlockIds) {
+  CVPipeline::DependencyHelper depHelper{memGraph};
+  for (Operation *op : ops) {
+    depHelper.forEachUserInSameBlock(op, [&](Operation *userInBlock) {
+      if (!userInBlock || isTerminatorInBlock(userInBlock, block)) {
+        return;
+      }
+      int bid = bm.getBlockIdByOp(userInBlock);
+      if (bid != -1 && bid != smallBlockId &&
+          isMergeableVectorBlockOp(userInBlock, bm)) {
+        downBlockIds.insert(bid);
+      }
+    });
+  }
+}
+
+static bool collectProducerSlice(Operation *op, int smallBlockId, Block *block,
+                                 CVPipeline::ComputeBlockIdManager &bm,
+                                 const CVPipeline::DependencyHelper &depHelper,
+                                 SetVector<Operation *> &slice) {
+  if (!op || bm.getBlockIdByOp(op) != smallBlockId) {
+    return true;
+  }
+  if (!isMergeableVectorBlockOp(op, bm)) {
+    return false;
+  }
+  if (!slice.insert(op)) {
+    return true;
+  }
+
+  bool ok = true;
+  depHelper.forEachSourceInSameBlock(op, [&](Operation *sourceInBlock) {
+    if (!sourceInBlock || !ok || isTerminatorInBlock(sourceInBlock, block)) {
+      return WalkResult::advance();
+    }
+    if (bm.getBlockIdByOp(sourceInBlock) != smallBlockId) {
+      return WalkResult::advance();
+    }
+    if (!collectProducerSlice(sourceInBlock, smallBlockId, block, bm,
+                              depHelper, slice)) {
+      ok = false;
+      return WalkResult::interrupt();
+    }
+    return WalkResult::advance();
+  });
+  return ok;
+}
+
+static bool hasUseOutsideSliceOrTarget(Operation *op, int targetBlockId,
+                                       Block *block,
+                                       CVPipeline::ComputeBlockIdManager &bm,
+                                       const CVPipeline::DependencyHelper
+                                           &depHelper,
+                                       const SetVector<Operation *> &slice) {
+  bool hasUnsafeUse = false;
+  depHelper.forEachUserInSameBlock(op, [&](Operation *userInBlock) {
+    if (!userInBlock || isTerminatorInBlock(userInBlock, block)) {
+      return WalkResult::advance();
+    }
+    if (slice.contains(userInBlock) ||
+        bm.getBlockIdByOp(userInBlock) == targetBlockId) {
+      return WalkResult::advance();
+    }
+    hasUnsafeUse = true;
+    return WalkResult::interrupt();
+  });
+  return hasUnsafeUse;
+}
+
+static bool isValidProducerSlice(int targetBlockId, Block *block,
+                                 CVPipeline::ComputeBlockIdManager &bm,
+                                 const CVPipeline::DependencyHelper &depHelper,
+                                 const SetVector<Operation *> &slice) {
+  if (slice.empty()) {
+    return false;
+  }
+  for (Operation *op : slice) {
+    if (hasUseOutsideSliceOrTarget(op, targetBlockId, block, bm, depHelper,
+                                   slice)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+static bool tryMergeProducerSliceToDownstream(
+    int smallBlockId, int downBlockId, Block *block,
+    CVPipeline::ComputeBlockIdManager &bm,
+    const CVPipeline::MemoryDependenceGraph &memGraph) {
+  CVPipeline::DependencyHelper depHelper{memGraph};
+  SetVector<Operation *> slice;
+
+  for (Operation *op : bm.getOpsByBlockId(smallBlockId)) {
+    bool usedByDownstream = false;
+    depHelper.forEachUserInSameBlock(op, [&](Operation *userInBlock) {
+      if (userInBlock && !isTerminatorInBlock(userInBlock, block) &&
+          bm.getBlockIdByOp(userInBlock) == downBlockId) {
+        usedByDownstream = true;
+        return WalkResult::interrupt();
+      }
+      return WalkResult::advance();
+    });
+    if (!usedByDownstream) {
+      continue;
+    }
+    if (!collectProducerSlice(op, smallBlockId, block, bm, depHelper, slice)) {
+      return false;
+    }
+  }
+
+  if (!isValidProducerSlice(downBlockId, block, bm, depHelper, slice)) {
+    return false;
+  }
+
+  SmallVector<Operation *> sliceOps(slice.begin(), slice.end());
+  if (CVPipeline::willCreateCycle(sliceOps, memGraph, downBlockId, bm)) {
+    LOG_DEBUG("Producer slice of block " << smallBlockId << " merge to "
+                                         << downBlockId
+                                         << " will create cycle!");
+    return false;
+  }
+
+  LOG_DEBUG("Merging producer slice of block "
+            << smallBlockId << " into block " << downBlockId);
+  for (Operation *op : sliceOps) {
+    bm.updateBlockId(op, downBlockId);
+  }
+  return true;
+}
+
+static bool tryMergeProducerSlicesToDownstream(
+    int smallBlockId, Block *block, CVPipeline::ComputeBlockIdManager &bm,
+    const CVPipeline::MemoryDependenceGraph &memGraph) {
+  auto ops = bm.getOpsByBlockId(smallBlockId);
+  llvm::SmallDenseSet<int> downBlockIds;
+  collectDownstreamBlockIds(smallBlockId, block, bm, ops, memGraph,
+                            downBlockIds);
+
+  bool changed = false;
+  for (int downBlockId : downBlockIds) {
+    ops = bm.getOpsByBlockId(smallBlockId);
+    if (ops.empty()) {
+      break;
+    }
+    if (!CVPipeline::willCreateCycle(ops, memGraph, downBlockId, bm)) {
+      continue;
+    }
+    if (tryMergeProducerSliceToDownstream(smallBlockId, downBlockId, block, bm,
+                                          memGraph)) {
+      changed = true;
+    }
+  }
+  return changed;
+}
+
 static std::optional<int>
 selectMergeTarget(SmallVector<int> &candidates,
                   const SmallVector<Operation *> &ops, Block *block,
@@ -755,6 +925,13 @@ void MergeSmallBlockPass::runOnOperation() {
       LOG_DEBUG("Processing small block " << nowBlockId);
       for (auto op : ops) {
         LOG_DEBUG("op:" << *op);
+      }
+
+      if (tryMergeProducerSlicesToDownstream(nowBlockId, block, bm, memGraph)) {
+        ops = bm.getOpsByBlockId(nowBlockId);
+        if (ops.empty()) {
+          continue;
+        }
       }
 
       SmallVector<int> candidates =
