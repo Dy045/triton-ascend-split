@@ -26,6 +26,10 @@
 - **新增重映射落盘函数 `remapInterCoreTransferFlagIds`**：把着色结果写回各 sync op 的 `static_flag_id` 属性；
 - 新增单测 `flag_reuse_over_limit.mlir`（超限才复用）、`flag_reuse_cross_direction.mlir`（V→C→V 长链场景）。
 
+**本次 main-dev 拉取更新要点**：
+- **`INIT_SIZE` 重命名为 `kInitSize`**：`SmallSet` 的 `N` 模板参数（内联元素数量上限）从 `CVPipeline::INIT_SIZE` 改名 `CVPipeline::kInitSize`，纯命名规范化，语义不变；
+- **flag 重映射起始值从 1 改为 0**：`colorInterferenceGraph` 的压缩重编号 `nextCompact` 初值由 `1` 改为 `0`，使最终 flag id 从 0 开始连续编号（详见 4.9）。
+
 ---
 
 ## 二、核心概念
@@ -300,7 +304,7 @@ bool FlagIdReuseManager::opPrecedes(Operation *p, Operation *q) {
   if (p->getBlock() == q->getBlock()) return p->isBeforeInBlock(q);
   // Cross block: only the real happens-before edges (E1 per-pipe FIFO, E2
   // set->wait, E3 data, E4 read-wait->consumed data) may prove ordering.
-  llvm::SmallSet<Operation *, CVPipeline::INIT_SIZE> visited;
+  llvm::SmallSet<Operation *, CVPipeline::kInitSize> visited;
   return hasPath(visited, p, q);   // DFS 找 p -> q 的路径
 }
 ```
@@ -382,7 +386,7 @@ DenseMap<int, int> FlagIdReuseManager::colorInterferenceGraph() {
   // 4. 贪心着色：每个节点取邻居未使用的最小颜色
   DenseMap<int, int> rawColor;
   for (int flagId : order) {
-    llvm::SmallSet<int, CVPipeline::INIT_SIZE> usedByNeighbours;
+    llvm::SmallSet<int, CVPipeline::kInitSize> usedByNeighbours;
     for (int nb : adj[flagId])
       if (rawColor.find(nb) != rawColor.end()) usedByNeighbours.insert(rawColor[nb]);
     int color = 1;
@@ -390,9 +394,9 @@ DenseMap<int, int> FlagIdReuseManager::colorInterferenceGraph() {
     rawColor[flagId] = color;
   }
 
-  // 5. 压缩重编号：按程序顺序把颜色映射为 1,2,3,...
+  // 5. 压缩重编号：按程序顺序把颜色映射为 0,1,2,...
   DenseMap<int, int> colorToCompact;
-  int nextCompact = 1;
+  int nextCompact = 0;
   DenseMap<int, int> remapResult;
   for (int flagId : flagIds) {
     int color = rawColor[flagId];
@@ -404,13 +408,14 @@ DenseMap<int, int> FlagIdReuseManager::colorInterferenceGraph() {
 ```
 
 - Welsh-Powell 贪心着色得到的是近似最优解（最小着色是 NP-hard），但足够用。
-- 最后一步"压缩重编号"让输出的 flag id 从 1 开始连续递增，节省 flag 资源且结果稳定（注释：output flag ids are minimal and stably ordered）。
+- 最后一步"压缩重编号"让输出的 flag id 从 0 开始连续递增，节省 flag 资源且结果稳定（注释：output flag ids are minimal and stably ordered）。
+- **main-dev 更新点**：`nextCompact` 的起始值由 `1` 改为 `0`——贪心着色的原始颜色（`rawColor`）仍从 `color = 1` 开始，但压缩阶段把连续编号的首个值下移到 0，使最终 flag id 落在 `[0, N-1]`，比旧版 `[1, N]` 多腾出一个 flag（0 号），进一步缓解 flag 资源紧张。
 
 ### 4.10 hasPath：DFS 可达性（L249-L265）
 
 ```cpp
 bool FlagIdReuseManager::hasPath(
-    llvm::SmallSet<Operation *, CVPipeline::INIT_SIZE> &visited,
+    llvm::SmallSet<Operation *, CVPipeline::kInitSize> &visited,
     Operation *from, Operation *to) {
   if (from == to) return true;
   if (visited.contains(from)) return false;

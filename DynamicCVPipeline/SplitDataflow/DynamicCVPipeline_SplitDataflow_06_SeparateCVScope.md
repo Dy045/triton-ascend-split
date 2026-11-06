@@ -19,6 +19,9 @@
 5. **控制流 op 集合扩展**：`isControlFlowOp` 新增 `scf::ParallelOp`；
 6. **循环结果"死壳"保留逻辑**：`normalizeRegionOp` 新增"循环体内无本核内容但结果仍被本核消费 → 整个循环保留"的分支，避免误中性化改变语义。
 
+**本次 main-dev 拉取更新要点**：
+7. **整数/索引标量循环携带变量无条件保留**：`shouldPreserveFromYield` 新增一条捷径——只要 `needsLoopCarryPreserve` 判定为循环携带、且对应 yield result 是 `IntOrIndex` 类型（纯标量），就直接返回 `true` 保留，**不再要求"存在混合核兄弟 result"**。原因是标量循环携带变量（如循环计数器、累加标量）不占 tensor buffer，跨核开销小、却常被两侧的 control 逻辑依赖，无条件保留比按"混合核"启发式判断更安全（详见 3.5.3）。
+
 ---
 
 ## 二、关键背景
@@ -236,11 +239,24 @@ static bool canSkipForwardingUse(OpOperand &use, StringRef scopeType) {
 #### 3.5.3 shouldPreserveFromYield / handleYieldUse（L380-L438）
 
 ```cpp
-// 只有当"循环携带证据 + 混合核的兄弟结果"同时成立才保留 yield→result 追踪
+// 保留"活跃的标量循环携带变量"，即使没有匹配的兄弟 result；
+// 其余值仍保留"混合核兄弟 result"这一约束。
 static bool shouldPreserveFromYield(Operation *yieldOwner, unsigned operandIndex,
                                     StringRef scopeType) {
   bool preserveLoopCarry = needsLoopCarryPreserve(yieldOwner, operandIndex, scopeType);
   if (!preserveLoopCarry) return false;
+
+  // main-dev 新增：整数/索引类型的标量循环携带变量 → 无条件保留
+  if (operandIndex < yieldOwner->getNumResults() &&
+      yieldOwner->getResult(operandIndex).getType().isIntOrIndex()) {
+    return true;
+  }
+
+  auto loopOp = dyn_cast<LoopLikeOpInterface>(yieldOwner);
+  if (!loopOp) return preserveLoopCarry;
+
+  auto ownerInfo = parseCoreTypeInfo(yieldOwner);
+  if (!ownerInfo) return preserveLoopCarry;
 
   unsigned numResults = yieldOwner->getNumResults();
   return llvm::any_of(llvm::seq<unsigned>(0, numResults), [&](unsigned i) {
@@ -268,6 +284,7 @@ static Operation *handleYieldUse(scf::YieldOp yieldOp, OpOperand &use,
 ```
 
 - **为什么需要"兄弟 result 判断"**：如果一个 for/while 的部分 result 属于本核、部分不属于，这个循环本身就必须在本核保留（结构上不能拆），此时 yield 到它的 use 视为活跃。
+- **main-dev 新增的标量捷径**：在走"兄弟 result"判断**之前**，先检查该 yield slot 对应的 result 是否是 `IntOrIndex`（整数/索引标量）。标量循环携带变量（计数器、累加标量、布尔标志等）不占 tensor buffer，跨核搬运成本几乎为零，却经常被两侧的 control 逻辑（循环边界、条件判断）依赖。若硬套"必须有混合核兄弟 result"这条启发式，标量携带变量在单核循环里就会被误判为"可丢弃"，导致另一侧拿到错误的中性值。因此 main-dev 把它升级为**无条件保留**。
 
 #### 3.5.4 classifyScopeRelevantUse：单个 use 的分类（L470-L518）
 

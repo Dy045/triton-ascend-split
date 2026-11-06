@@ -11,6 +11,7 @@
 > - [`UpdateLoopOps.cpp`](../../../third_party/ascend/lib/DynamicCVPipeline/AddControlFlowCondition/UpdateLoopOps.cpp)（Step 4：扩展循环 + PIPE_S）
 > - [`UpdateConditionInfo.cpp`](../../../third_party/ascend/lib/DynamicCVPipeline/AddControlFlowCondition/UpdateConditionInfo.cpp)（Step 5：构造 if 条件）
 > - [`UpdateLoopIterTimes.cpp`](../../../third_party/ascend/lib/DynamicCVPipeline/AddControlFlowCondition/UpdateLoopIterTimes.cpp)（Step 6：扩展迭代次数）
+> - [`SplittedIfWrapSsbufIf.cpp`](../../../third_party/ascend/lib/DynamicCVPipeline/AddControlFlowCondition/SplittedIfWrapSsbufIf.cpp)（Step 7：用 splitted_if 条件包装 ssbuffer.if）
 >
 > 流水线位置：`AllocMultiCache`（L82）之后、`SeparateMemoryFromCompute`（L84）之前。此时多缓冲已分配、轮询结构已注入，本 Pass 把"缓冲是否可用"的**轮询条件**真正落地为 `scf.if` 上的可执行表达式，并打通 CUBE/Vector 两侧的流水线握手。
 
@@ -27,9 +28,10 @@
 3. **建依赖**：从 `ssbuffer.cross_deps` / `ssbuffer.intra_deps` 属性还原依赖图，构建 if 块 DAG，检测循环，收集 `flowOpt` 流水线重叠候选；
 4. **扩展循环**：给主循环追加三类 extra iter_arg——**block 计数器**（跟踪每 block 当前迭代）、**核内依赖计数**（跟踪每依赖组缓冲占用）、**tensor iter_arg 计数**（跟踪跨迭代张量依赖）；并插入 `PIPE_S` 核间同步（flag 15）；
 5. **算条件**：基于计数变量构造 if 条件——核间用 SSBuffer 指针数组计数（输入 `loaded>0`、输出 `loaded<producer_num`），核内用 loop iter_arg 计数（输入 `>0`、输出 `<producer_num`），tensor 迭代依赖用 `==1/==0` 判断，全部 And 合并后重建 if；
-6. **扩迭代**：按依赖距离 `consumer_idx - producer_idx + 1` 计算所需缓冲数，用分数交叉相乘比较取最大值，把 for 循环迭代次数扩展为 `ceil(iter * requiredBuffers / x) + ifCount`，保证依赖有足够缓冲空间。
+6. **扩迭代**：按依赖距离 `consumer_idx - producer_idx + 1` 计算所需缓冲数，用分数交叉相乘比较取最大值，把 for 循环迭代次数扩展为 `ceil(iter * requiredBuffers / x) + ifCount`，保证依赖有足够缓冲空间；
+7. **包装 splitted_if**：`SplitIfByBlockId` 拆出的 `splitted_if` 与 `AllocMultiCache` 注入的 `ssbuffer.if` 是**两个独立 if**，本步把 splitted_if 的条件提升、用它的条件新建外层 if 把 ssbuffer.if 包进 then 分支，使分裂后的块共享同一个循环迭代分派条件。
 
-**6 个子 Pass 顺序执行，任意失败统一 fallback**（AddControlFlowCondition.cpp L138-L143）。
+**7 个子 Pass 顺序执行，任意失败统一 fallback**（AddControlFlowCondition.cpp L138-L143）。
 
 ---
 
@@ -120,6 +122,12 @@ void AddControlFlowConditionPass::runOnOperation() {
   updateLoopIterTimesPass->setConditionInfo(&info);
   pm.addPass(std::move(updateLoopIterTimesPass));
 
+  // Step7: Use the splitted_if condition to wrap each ssbuffer.if.
+  std::unique_ptr<SplittedIfWrapSsbufIfPass> splittedIfWrapSsbufIfPass(
+      new SplittedIfWrapSsbufIfPass());
+  splittedIfWrapSsbufIfPass->setConditionInfo(&info);
+  pm.addPass(std::move(splittedIfWrapSsbufIfPass));
+
   if (failed(runPipeline(pm, module))) {
     LDBG("Pass failed!");
     if (!CVPipeline::hasFallbackAttr(module)) {
@@ -196,6 +204,10 @@ AddControlFlowConditionPass
             ├─► UpdateForLoopIteration          同 id 两侧取 max，克隆 for 换新 upperBound
             ├─► replaceForOpCounterInIfOps      用 cntArgs 替换归纳变量
             └─► UpdateWhileLoopCondition        while 条件按 per-block arg 克隆合并 OR
+  └─► Step7: SplittedIfWrapSsbufIf   用 splitted_if 条件包装 ssbuffer.if
+            ├─► checkCanWrap                   遍历主循环收集 (ssbuffer.if, 唯一 splitted_if)
+            ├─► splittedIfWrapSsbufIf          hoist 条件 + 新建外层 if 包 ssbuf.if + else 重建
+            └─► unwrapSplittedIf               展开 splitted_if 的 then 到外层并删除
 ```
 
 ### 4.2 与前后 Pass 的协作
@@ -210,7 +222,7 @@ AddControlFlowConditionPass
 
 1. **AddControlFlowCondition 的目标是什么？** `AllocMultiCache` 只分配了多缓冲、打了占位 `if %true`；本 Pass 把这些占位 if 变成可执行的同步条件（基于计数），并保证 CUBE/Vector 两侧流水线启动对齐（PIPE_S），最后按依赖距离扩展迭代次数，使依赖有足够缓冲空间。
 
-2. **为什么拆成 6 个子 Pass？** 依赖链严格线性：先**去共享**（CloneOps）才能安全地按 block 拆分状态；再**拆 arg**（ProcessArgs）让每个 block 状态独立；再**建 if 骨架**（CreateIfOps）提供块级控制点；再**建依赖图**（InitDependentMap）指导后续；再**扩展循环**（UpdateLoopOps）提供计数器变量；再**算条件**（UpdateConditionInfo）真正落表达式；最后**扩迭代**（UpdateLoopIterTimes）保证缓冲充足。每个子 Pass 职责单一，失败可独立 fallback。
+2. **为什么拆成 7 个子 Pass？** 依赖链严格线性：先**去共享**（CloneOps）才能安全地按 block 拆分状态；再**拆 arg**（ProcessArgs）让每个 block 状态独立；再**建 if 骨架**（CreateIfOps）提供块级控制点；再**建依赖图**（InitDependentMap）指导后续；再**扩展循环**（UpdateLoopOps）提供计数器变量；再**算条件**（UpdateConditionInfo）真正落表达式；再**扩迭代**（UpdateLoopIterTimes）保证缓冲充足；最后**包装 splitted_if**（SplittedIfWrapSsbufIf）把分裂块与多缓冲轮询合并为一个迭代分派 if。每个子 Pass 职责单一，失败可独立 fallback。
 
 3. **为什么必须先 CloneOps 去共享？** 多缓冲轮换的前提是"每个 block 看到的是自己那份数据"。如果 op 被多个 block 共享，同一 op 的结果被多个 if 复用，计数器增减就会互相污染。反向克隆（从最后一个 block 开始）后每个 block 有独立 op 副本，才能独立控流。
 
@@ -225,3 +237,5 @@ AddControlFlowConditionPass
 8. **迭代次数为什么是 `ceil(iter * requiredBuffers / x) + ifCount`？** producer 有 `x` 个缓冲（producerOps.size()），依赖距离需要 `requiredBuffers = consumer_idx - producer_idx + 1` 块缓冲；迭代数放大 `requiredBuffers/x` 倍并向上取整，最后 `+ifCount` 是给每个 block 的 if 占用一拍的缓冲余量。用分数交叉相乘比较 `requiredBuffers/x` 避免浮点精度。
 
 9. **整个 Pass 的 fallback 策略？** 每个子 Pass 内部失败即 `setFallbackAttr(ERRCODE_FAILED)`；DAG 有环置 `ERRCODE_IGNORED`（与 FAILED 区分：IGNORED 表示"不做流水线也正确，只是没优化"）。主 Pass 入口与子 Pass 都先检查 `hasFallbackAttr` 短路，保证幂等。
+
+10. **为什么需要 SplittedIfWrapSsbufIf（Step7）？** `SplitIfByBlockId` 依据 block_id 把 if 拆成多个 `kSplittedIf`（分裂块），而 `AllocMultiCache` 又为每个传输依赖注入 `ssbuffer.if`（多缓冲轮询）。两者本是一体却被拆成了**两个独立 if**，导致同一个块内既有"分裂分派"又有"缓冲轮询"两层条件。本 Step 用 splitted_if 的条件新建外层 if 把 ssbuffer.if 包进 then，再展开原 splitted_if——最终一个块只剩**一个**迭代分派 if（外层分裂条件）+ 内部多缓冲轮询，语义对齐"分裂后的块共享同一循环迭代条件"。

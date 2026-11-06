@@ -281,6 +281,8 @@ static LogicalResult processSharedArgsIteration(
 
 **要点**：新 arg 的初值 = 原 arg 的 init（`extraInitArgs.push_back(origInits[info.argIndex])`），克隆链插到非 owner block 的末尾，克隆 op 打 `kBlockId = nonOwnerBlockId` 与 `kArg = argIndex`；`replaceIterArgsInBlock` 把该 block 内原 arg 的 uses 换成克隆结果。
 
+**main-dev 更新点**：`cloneChainForBlock` 在 `cloneBuilder.clone(*op, opMapper)` 后新增判空——`if (!cloned) { LDBG(...); return failure(); }`。这是防御性健壮性补充：`OpBuilder::clone` 在 operands 映射缺失或类型不匹配等异常情况下可能返回 null，旧代码直接 `cloned->setAttr(...)` 会空指针解引用；现在先判空并让整个共享 arg 拆分失败退回（`processSharedArgsIteration` 里 `if (failed(...)) continue;` 会跳过该 arg，而非崩溃）。
+
 ### 3.8 for 路径收尾：processSharedArgsInForOp（L386-L406）
 
 ```cpp

@@ -123,7 +123,7 @@ void PreCheckMatmul::runOnOperation() {
 // 这些函数已知不支持 3-preload（显式多缓冲）
 static const llvm::SmallVector<llvm::StringRef> kBlacklistFuncNames = {
     "_attn_bwd", "kernel_sdpa_fwd", "_swa_paged_decode_kernel",
-    "_mqa_logits_kernel", "paged_decode_fd_kernel"};
+    "paged_decode_fd_kernel"};
 
 void PreCheckDisablePreload::runOnOperation() {
   ModuleOp module = getOperation();
@@ -156,7 +156,7 @@ void PreCheckDisablePreload::runOnOperation() {
 }
 ```
 
-- 名单里的 5 个函数是 Attention 系列的 kernel（flash-attn 前向/反向、mqa、paged_decode 等），这些 kernel 的 buffer 依赖复杂，3-preload（3 份 buffer 交替）可能超 UB 容量或破坏同步。
+- 名单里的 4 个函数是 Attention 系列的 kernel（flash-attn 前向/反向、swa paged_decode 等），这些 kernel 的 buffer 依赖复杂，3-preload（3 份 buffer 交替）可能超 UB 容量或破坏同步。
 - `setBufferCount` 会往模块属性 `ssbuffer.intra_buf_count` / `ssbuffer.inter_core_buf_count` 写入 2 / 1，`AllocMultiCache` 按此分配多缓冲。
 - **特例**：`kernel_sdpa_fwd` 如果前端已显式指定 `intra=3, inter=2`，说明该路径经过验证可行，不降级。
 - 注意：`_attn_bwd` 也依赖 `AddDynamicCVPipeline` 失败重试时的 buffer 修改（见主流程：重试时同样设置 2/1），两处策略一致。

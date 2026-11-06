@@ -195,12 +195,14 @@ static int collectExtraSync(const SmallVector<Operation *> &ops,
       if (flag(setOp) == originalFlag && flag(waitOp) == originalFlag) {
         info.setOp = setOp; info.waitOp = waitOp; return 0;
       }
-  // 兜底：无精确匹配用第一对
-  ...
+  // 无精确匹配 → 不设置 extraSync（main-dev 移除"取第一对"的兜底）
+  return 0;
 }
 ```
 
 **要点**：`parentOpHasMainLoopAttr`（L87-L92）用 `findMainLoopOp`（L81-L84）向上找带 `kMainLoop` 的祖先。**extraSync 是循环外**的同步（如 scope 级初始化同步），它们的输出 flag 同步 op 要插在**循环外**对应位置（`createOutputBufferForGroup` 中处理）。
+
+**main-dev 更新点**：移除了"当精确匹配失败时取第一对 available pair 兜底"的逻辑。原因：不同 flag 的 set/wait 生命周期不同，胡乱拿"第一对"当作该组的 extraSync 会让输出 flag 的 set/wait 插到**错误 flag 的边界位置**，破坏同步时序（甚至死锁）。宁可让 `extraSyncSetOp/WaitOp` 保持空（交给后面的 `createOutputBufferForGroup` 按"只有真正的 drain 才是合法插入点"处理），也不做不确定的兜底。
 
 ### 3.5 循环内传输链：collectTransferChains（L425-L495）
 
@@ -271,12 +273,56 @@ static int tagLoadStoreOpsWithCrossDeps(DenseMap<int, SmallVector<Operation *>> 
 ### 3.7 Step 1c：分组汇总 + 输出 flag 共享（L582-L622）
 
 ```cpp
-static int collectTransferGroupData(ModuleOp module, opsByTid, flagIdMgr, groups) {
+// main-dev 新增：判断一个组能否借用"同通道另一组"的循环外同步生命周期
+static bool hasSharedSyncLifecycle(const TransferGroupInfo &group,
+                                   const TransferGroupInfo &owner,
+                                   DominanceInfo &dom,
+                                   PostDominanceInfo &postDom) {
+  if (!owner.extraSyncSetOp || !owner.extraSyncWaitOp ||
+      !group.senderChain.setOp || !group.receiverChain.waitOp)
+    return false;
+  Operation *seed     = owner.extraSyncSetOp;   // owner 的 seed（循环外 set）
+  Operation *drain    = owner.extraSyncWaitOp;  // owner 的 drain（循环外 wait）
+  Operation *sender   = group.senderChain.setOp;
+  Operation *receiver = group.receiverChain.waitOp;
+  // 借用前提：seed/drain 与 sender/receiver 在各自核侧"包围"住对方的生命周期
+  return seed->getParentOfType<scope::ScopeOp>() ==
+             receiver->getParentOfType<scope::ScopeOp>() &&
+         drain->getParentOfType<scope::ScopeOp>() ==
+             sender->getParentOfType<scope::ScopeOp>() &&
+         dom.properlyDominates(seed, receiver) &&        // seed 支配 receiver
+         postDom.properlyPostDominates(drain, sender);   // drain 后支配 sender
+}
+
+static int collectTransferGroupData(ModuleOp module, opsByTid, flagIdMgr, groups,
+                                    bool isDoubleBuf) {   // main-dev 新增 isDoubleBuf
   for (auto &p : opsByTid) {
     TransferGroupInfo info;
     if (buildTransferGroupData(p.first, p.second, info)) continue;
     if (info.senderChain.transferOp || info.receiverChain.transferOp)
       groups[p.first] = info;                 // 只有链完整的组才进入
+  }
+
+  // 单缓冲模式：不需要第二个 flag，也不需要生命周期证明，直接返回
+  if (!isDoubleBuf) return 0;
+
+  // main-dev 新增：缺失自身 seed/drain 的组，必须被"同通道另一组"的
+  // 生命周期覆盖，否则 ERRCODE_FAILED（而非静默改变缓冲策略）
+  DominanceInfo dom(module);
+  PostDominanceInfo postDom(module);
+  for (auto &p : groups) {
+    const auto &group = p.second;
+    if (group.extraSyncSetOp && group.extraSyncWaitOp) continue;   // 自身完整 → 跳过
+    bool covered = false;
+    for (auto &q : groups) {
+      const auto &owner = q.second;
+      if (group.originalFlag == owner.originalFlag &&
+          group.isCtoV == owner.isCtoV &&
+          hasSharedSyncLifecycle(group, owner, dom, postDom)) {
+        covered = true; break;              // 被 owner 的生命周期包围 → 覆盖
+      }
+    }
+    if (!covered) return -1;                // 无覆盖 → fallback
   }
 
   // 输出 flag 复用：同一 (originalFlag, direction) 共享一个输出 flag
@@ -303,6 +349,11 @@ static int collectTransferGroupData(ModuleOp module, opsByTid, flagIdMgr, groups
 - **输出 flag 共享**：多个传输共用同一原始 flag + 方向时，它们用同一块输出 flag —— 因为同方向的传输同步位天然对齐，共享 flag 不会冲突（省 flag 资源，flag 0-14 只有 15 个）；
 - `acquireId()` 分配时**跳过与原 flag 相同的 id**（避免输出 flag 撞原 flag）；
 - `std::map` 按键排序遍历保证**确定性分配**（同一输入多次运行结果一致）。
+
+**本次 main-dev 拉取更新要点（3 处）**：
+- **`collectTransferGroupData` 新增 `isDoubleBuf` 参数**：`runOnOperation` 传入 `isDoubleBuf`；单缓冲模式在收集完组后**立即 `return 0`**，跳过所有"输出 flag 共享/借用"逻辑——单缓冲只有一个 flag、一块缓冲，根本不存在"第二块缓冲需要第二个 flag"的诉求；
+- **新增"生命周期覆盖"正确性门禁**：双缓冲下每个组都应有自己的 `extraSyncSetOp`(seed) + `extraSyncWaitOp`(drain) 来支撑输出 flag 的循环外 set/wait。若某组缺失这对（如 `collectExtraSync` 没匹配到精确 pair），main-dev 不再静默放行，而是检查是否有**同通道**（同 `originalFlag` + 同 `isCtoV`）的另一个组，其 seed/drain 能用支配/后支配关系"包围"住本组的 sender-set/receiver-wait——`hasSharedSyncLifecycle` 用 `DominanceInfo::properlyDominates`（seed 支配 receiver）和 `PostDominanceInfo::properlyPostDominates`（drain 后支配 sender）来证明包围关系。找不到覆盖 → `return -1` 触发 fallback，宁可回退也不产生时序错误的双缓冲；
+- **新增 `#include "mlir/IR/Dominance.h"`**：为上述 dominance/post-dominance 分析提供支持。
 
 ### 3.8 Step 2：创建输出缓冲（L630-L801）
 
@@ -334,9 +385,10 @@ static int createOutputBufferForGroup(TransferGroupInfo &g, OpBuilder &builder) 
                          g.receiverInputBuffer, g.receiverOutputBuffer, builder, false);
   // ③ 输出同步 set 插在 extraSync.setOp 位置（sender scope）
   if (g.extraSyncSetOp) createOutputSyncSetOp(g.extraSyncSetOp, g.outputFlag, g.tid, builder);
-  // ④ 输出同步 wait 插在 extraSync.waitOp（或 receiverChain.waitOp）位置（receiver scope）
-  Operation *outputWaitInsertOp = g.extraSyncWaitOp ? g.extraSyncWaitOp : g.receiverChain.waitOp;
-  if (outputWaitInsertOp) createOutputSyncWaitOp(outputWaitInsertOp, g.outputFlag, g.tid, builder);
+  // ④ 输出同步 wait 只插在真正的 drain（extraSync.waitOp）位置（receiver scope）
+  //    （main-dev 移除"回退到 receiverChain.waitOp"：循环内 receiver wait 是数据
+  //     消费点，不该再挂第二个固定 flag 等待）
+  if (g.extraSyncWaitOp) createOutputSyncWaitOp(g.extraSyncWaitOp, g.outputFlag, g.tid, builder);
   return 0;
 }
 

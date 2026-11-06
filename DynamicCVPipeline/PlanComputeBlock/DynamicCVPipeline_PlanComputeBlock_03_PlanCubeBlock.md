@@ -1,6 +1,6 @@
 # DynamicCVPipeline 子 Pass 逐行讲解：PlanCubeBlockPass
 
-> 源码文件：[`third_party/ascend/lib/DynamicCVPipeline/PlanComputeBlock/PlanCubeBlock.cpp`](../../../third_party/ascend/lib/DynamicCVPipeline/PlanComputeBlock/PlanCubeBlock.cpp)（595 行）
+> 源码文件：[`third_party/ascend/lib/DynamicCVPipeline/PlanComputeBlock/PlanCubeBlock.cpp`](../../../third_party/ascend/lib/DynamicCVPipeline/PlanComputeBlock/PlanCubeBlock.cpp)（624 行）
 >
 > 头文件：[`third_party/ascend/include/DynamicCVPipeline/PlanComputeBlock/PlanCubeBlockPass.h`](../../../third_party/ascend/include/DynamicCVPipeline/PlanComputeBlock/PlanCubeBlockPass.h)
 >
@@ -30,6 +30,8 @@
 |---|---|
 | `isCubeSimpleOpOrCf` | CUBE op 且非同步 op 且非 terminator（`!isSyncOp && core_type==CUBE_ONLY`） |
 | `matchSeed` | 从 matmul 出发，匹配合法的输入种子（transpose/to_tensor/fill/empty/broadcast/expand/extf）和输出种子（store/materialize/view/extract_slice/L0C cascade matmul） |
+| `kCoupledMatmulAndStore` | matmul 与"执行后 store 1"的成对 id；`matchSeed` 据此通过 `coupledStoreMap` 把配对 store 纳入种子组 |
+| `coupledStoreMap` | `DenseMap<int64_t, Operation*>`：分块前置扫描 block，按 `kCoupledMatmulAndStore` id 建"id → memref.store"映射 |
 | `SeedRegionPlanner` | Phase 1 的 BFS 扩张器：从 seeds 出发，沿依赖边把"可并入且无环"的 CUBE op 加进 group |
 | `TopologicalPartitionPlanner` | Phase 2 的拓扑调度器：处理剩余 CUBE op，一波一个块 |
 | `DependencyCycleDetector` | DFS 环检测：`{block, depHelper, okSet, bm}`，检测把候选组并入后是否成环 |
@@ -42,7 +44,7 @@
 
 ## 三、逐行讲解
 
-### 3.1 主流程：`runOnOperation`（L554-L590）
+### 3.1 主流程：`runOnOperation`（L578-L614）
 
 ```cpp
 void mlir::triton::PlanCubeBlockPass::runOnOperation() {
@@ -55,6 +57,10 @@ void mlir::triton::PlanCubeBlockPass::runOnOperation() {
   auto bm = ComputeBlockIdManager(moduleOp);             // 扫描已有 id（含同步 op 的）
 
   auto result = moduleOp.walk<WalkOrder::PreOrder>([&](Block *block) {
+    // 打包 scope 单元是原子整体，内部 op 不参与 CUBE 分块
+    if (isa_and_nonnull<scope::ScopeOp>(block->getParentOp())) {
+      return WalkResult::skip();
+    }
     // 纯 CUBE 的 scf 父 op 的子 block：直接继承父 id，跳过分块
     if (bm.shouldInheritFromParent(block, CoreType::CUBE_ONLY)) {
       if (llvm::failed(bm.inheritFromParent(block))) { ... return interrupt; }
@@ -72,10 +78,11 @@ void mlir::triton::PlanCubeBlockPass::runOnOperation() {
 ```
 
 - **PreOrder walk**：外层 block 先处理。因为分块以"block 内 op"为单位，嵌套 block 在各自 walk 回调中独立处理。
+- **新增 `scope::ScopeOp` 剪枝**：`PackMemrefPass` 打包出的 `scope` 单元已带权威 `kCoreType`、是原子整体，其内部 op 不能被打散成独立 block id（否则破坏"原子单元"语义）。`WalkResult::skip()` 整棵子树跳过，scope 整体作为普通 op 在父 block 内被分块。
 - 继承分支：OpClassifier 把某个 scf.for/while 整体标成 CUBE 后，其子 block 直接 `inheritFromParent`（复用父 op 的 id），不再独立分块——整环一体。
 - `memGraph` 是 `getAnalysis<AliasAnalysis>()`（pass 分析缓存）构建，与 OpClassifier 用的是不同实例（各自 pass 独立），但语义一致。
 
-### 3.2 单 block 分块入口：`processBlockWithCubeBFS`（L494-L552）
+### 3.2 单 block 分块入口：`processBlockWithCubeBFS`（L509-L576）
 
 ```cpp
 static llvm::LogicalResult
@@ -85,11 +92,21 @@ processBlockWithCubeBFS(Block *block, const DependencyHelper &depHelper,
   auto allDots = collectMatmulOps(block);      // 收集 block 内所有 matmul
   SyncWall wall(block);                        // 同步栅栏分段
 
+  // 前置建立 coupled store 映射：id → memref.store（配对 store 1）
+  llvm::DenseMap<int64_t, Operation *> coupledStoreMap;
+  for (Operation &op : *block) {
+    if (auto coupledId = op.getAttrOfType<IntegerAttr>(kCoupledMatmulAndStore)) {
+      if (isa<memref::StoreOp>(op))
+        coupledStoreMap[coupledId.getInt()] = &op;
+    }
+  }
+
   // Phase 1: 以 matmul 为核心的种子扩张
   for (auto *dot : allDots) {
     if (assigned.contains(dot)) continue;
     auto temBlockId = bm.getNextId();
-    llvm::SmallVector<Operation *> dotSeeds = matchSeed(dot, bm, depHelper.memGraph);
+    llvm::SmallVector<Operation *> dotSeeds =
+        matchSeed(dot, bm, depHelper.memGraph, coupledStoreMap);
 
     // 剪掉跨同步的种子（属于另一段的种子交给 Phase 2 独立发 id）
     llvm::erase_if(dotSeeds, [&](Operation *seed) {
@@ -115,17 +132,27 @@ processBlockWithCubeBFS(Block *block, const DependencyHelper &depHelper,
 ```
 
 - 一个 matmul 一个种子组：matmul 与其直接相关的输入输出 op 先聚成"种子组"，再 BFS 扩张。`assigned` 保证每个 op 只被处理一次。
+- **`coupledStoreMap` 前置建立**：遍历 block 内带 `kCoupledMatmulAndStore` 的 op，其中 `memref::StoreOp` 按 id 建映射。这是 `SplitMatmulPass` MNE guard 的"执行后 store 1"——`matchSeed` 据此把它与 matmul 配对进同一种子组，保证累加器落地 store 与 matmul 同块。
 - **跨同步种子剪枝**：`matchSeed` 可能匹配到同步另一侧的 op（如 for 之外的 store），这些种子属于别的段，直接删掉——它们会在 Phase 2 拿到独立 id，从而"任何块都不跨同步"。
 - `willCreateCycle`（L525 处的局部函数，基于 `DependencyCycleDetector`）：种子组内部就不允许有环，否则后续扩张全错。
 
-### 3.3 种子匹配：`matchSeed`（L454-L488）
+### 3.3 种子匹配：`matchSeed`（L458-L502）
 
 ```cpp
 static SmallVector<Operation *>
 matchSeed(Operation *dotOp, ComputeBlockIdManager &bm,
-          const MemoryDependenceGraph &memGraph) {
+          const MemoryDependenceGraph &memGraph,
+          const llvm::DenseMap<int64_t, Operation *> &coupledStoreMap) {
   SmallVector<Operation *> ret;
   ret.push_back(dotOp);                              // matmul 自己是第一个种子
+
+  // 若 matmul 带 kCoupledMatmulAndStore 标记，把配对 store 也纳入种子组
+  if (auto coupledId = dotOp->getAttrOfType<IntegerAttr>(kCoupledMatmulAndStore)) {
+    if (auto *storeOp = coupledStoreMap.lookup(coupledId.getInt())) {
+      ret.push_back(storeOp);
+    }
+  }
+
   // ---- 输入侧 ----
   for (Value operand : dotOp->getOperands()) {
     Operation *def = operand.getDefiningOp();
@@ -152,8 +179,9 @@ matchSeed(Operation *dotOp, ComputeBlockIdManager &bm,
 }
 ```
 
-- `checkValidInputSeed`（L431-L436）：白名单 `transpose / to_tensor / fill / empty / broadcast / expand_shape / extf`——与 OpClassifier 的种子 pattern 保持一致（注释 `keep unify to OpClassifer`）。
-- `checkValidUserSeed`（L437-L452）：输出侧白名单 `store / materialize / view / extract_slice`，外加一个特殊场景：**L0C cascade matmul**——下一个 matmul 把本 matmul 的结果当 `DpsInit[0]`（bias，L0C→L0C），这种"链条 matmul"也并入同组。
+- **新增配对 store 逻辑**：`matchSeed` 开头检查 matmul 是否带 `kCoupledMatmulAndStore`；若有，从 `coupledStoreMap` 查对应 id 的 `memref.store`，直接并入种子组。这是 MNE guard 的"累加器落地 store"，必须与 matmul 同块（与 OpClassifier 的 `patternMatchCUBE` 保持联动）。
+- `checkValidInputSeed`（L434-L439）：白名单 `transpose / to_tensor / fill / empty / broadcast / expand_shape / extf`——与 OpClassifier 的种子 pattern 保持一致（注释 `keep unify to OpClassifer`）。
+- `checkValidUserSeed`（L441-L457）：输出侧白名单 `store / materialize / view / extract_slice`，外加一个特殊场景：**L0C cascade matmul**——下一个 matmul 把本 matmul 的结果当 `DpsInit[0]`（bias，L0C→L0C），这种"链条 matmul"也并入同组。
 - **`isOnlyDirectlyUse`**：输入种子必须"只被本 matmul 直接使用"，否则并入会拖进无关消费链，破坏块内纯度。
 
 ### 3.4 Phase 1 扩张器：`SeedRegionPlanner`（L77-L151）
@@ -261,13 +289,15 @@ static void fuseMarkOpToDef(Block *block, ComputeBlockIdManager &bm,
 ```
 PlanCubeBlockPass
 └─ walk 每个 Block（PreOrder）
+   ├─ scope::ScopeOp 父 op → skip（打包单元原子，内部不打 block id）
    ├─ 继承分支：纯 CUBE scf 父 op → 子 block 直接 inheritFromParent
    └─ processBlockWithCubeBFS
+      ├─ 前置：build coupledStoreMap（kCoupledMatmulAndStore 的 id → memref.store）
       ├─ Phase 1（种子扩张）
       │   └─ 每个 matmul：
-      │      ├─ matchSeed：输入白名单（transpose/to_tensor/fill/empty/broadcast/
-      │      │              expand/extf，需 isOnlyDirectlyUse）+ 输出链（store/
-      │      │              materialize/view/extract_slice/L0C-cascade matmul）
+      │      ├─ matchSeed：配对 store（coupledStoreMap）+ 输入白名单（transpose/
+      │      │              to_tensor/fill/empty/broadcast/expand/extf，需 isOnlyDirectlyUse）
+      │      │              + 输出链（store/materialize/view/extract_slice/L0C-cascade matmul）
       │      ├─ 剪跨同步种子 → willCreateCycle 预检
       │      └─ SeedRegionPlanner.run：BFS 沿上游扩张
       │         ├─ isEligible：CUBE、未分配、非 matmul、并入无环
@@ -310,3 +340,9 @@ PlanCubeBlockPass
 
 8. **失败处理为什么统一 fallback 而不是就地修复？**
    分块是"分配决策"，一旦中途失败（种子成环、拓扑死锁），IR 上可能已经打了一半的 block id，状态不一致。此时无法保证后续 pass 正确性，直接 `ERRCODE_FAILED` 回退标准编译是最安全的选择——CV 流水线是"锦上添花"，失败必须无损回退。
+
+9. **`kCoupledMatmulAndStore` 配对 store 为什么由 `coupledStoreMap` 显式并入种子组？**
+   `SplitMatmulPass` 的 MNE guard 会插入一个"执行后 store 1"（把累加器落地到跨核 SSBuffer），它带 `kCoupledMatmulAndStore` 成对 id。这个 store 与 matmul **没有常规的邻接/单用户链关系**（不在输入白名单、也不在输出侧的 view/extract_slice 链上），所以 `matchSeed` 需要单独：先在 `processBlockWithCubeBFS` 里按 id 建 `coupledStoreMap`，再在 `matchSeed` 开头直接查表把 store 塞进种子组。这样累加器落地 store 与 matmul 严格同块，跨核同步不会被错位到别的块。
+
+10. **为什么 `runOnOperation` 要把 `scope::ScopeOp` 的子 block 整棵 `skip()`？**
+    `PackMemrefPass` 打包出的 `scope` 单元已经是"原子整体"且带权威 `kCoreType`，其内部 ops 应该作为一个不可拆的 unit 参与后续分块与传输。若这里仍给内部 op 逐一发 block id，等于把 scope 重新打散，破坏上游精心建立的原子边界。跳过整棵子树，让 scope 作为一个整体 op 在父 block 里被自然分块。

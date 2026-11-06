@@ -36,6 +36,14 @@
 - 标量同步改用 `PIPE_S`（与 tensor flag 空间隔离）；
 - `computeExpectedShape` 简化：不再区分 matmul A/B 场景，统一按 NZ 对齐计算。
 
+**本次 main-dev 拉取更新要点**：
+- **flag id 改为上游预分配**：不再在 `handleVectorToCube`/`handleCubeToVector`/`handleMemoryDependency` 里现场 `flagManager.acquireId()`，而是直接用 `dep.flagId`（由 `DataDependencyAnalysis::analyzeSyncReuse` 提前分好，详见 08 SyncAnalysis 篇）；
+- **`TransferSyncInsertPoint` 结构体**：把散落的 `prodStart/prodEnd/consStart/consEnd` 四个局部指针收敛为一个结构体，贯穿 `insertInterCoreSync`/`insertMemDepSync`/`insertVectorToCubeTransfer` 等函数的签名；
+- **`sortDependencies` 移走**：依赖排序从本 Pass 移到了 `DataDependencyAnalysisPass`（分析阶段就去重+排序，本 Pass 拿到时已有序）；
+- **新增循环区间复用同步（`reuseStartEnd`）**：`insertInterCoreSync` / `insertMemDepSync` 新增分支——当 `dep.reuseStartEnd` 为真（flag 被跨 region 复用）时，额外插入"循环开始前 set / 循环结束后 wait"的 start/end 边界同步；并新增 `findLoopRange(module)` 计算 `loopStartBound`/`loopEndBound`；
+- **`setSubBlockId` 传播**：outline start/end 同步及写同步 op 会继承源 op 的 sub-block id；
+- **`isOutlineReuseBlacklistKernel`**：黑名单 kernel（`kernel_da_fwd_u`）跳过循环区间复用。
+
 ---
 
 ## 二、关键背景：昇腾硬件 pipe 与地址空间
@@ -319,26 +327,38 @@ bool InterCoreTransferAndSyncPass::isStoreDirectlyInUserChain(Value toTensorValu
 
 ```cpp
 void InterCoreTransferAndSyncPass::insertInterCoreSync(
-    OpBuilder &builder, Operation *transferOp, Operation *consumerStartOp,
-    Operation *consumerEndOp, int flag, Location loc, int transferIndex,
-    FlagIdReuseManager &flagIdReuseManager, Operation *consumedDataOp,
-    bool isStoreDirectly) {                                  // 新增参数
+    OpBuilder &builder, Operation *transferOp, DependencyInfo &dep,
+    TransferSyncInsertPoint &insertPoint, int flag, Location loc,
+    int transferIndex, FlagIdReuseManager &flagIdReuseManager,
+    Operation *consumedDataOp, bool isStoreDirectly) {       // 本次更新：签名改为 dep + insertPoint
   auto config = getTransferPipeConfig(transferOp, isStoreDirectly);
 
   // 读同步：传输后 set，消费前 wait
   builder.setInsertionPointAfter(transferOp);
   auto setOpForRead = builder.create<SyncBlockSetOp>(loc, config.srcCoreAttr, config.forReadTPipe, config.forReadPipe, flagId);
-  builder.setInsertionPoint(consumerStartOp);
+  builder.setInsertionPoint(insertPoint.consStart);
   auto waitOpForRead = builder.create<SyncBlockWaitOp>(loc, config.dstCoreAttr, ...);
 
-  if (mainLoopOp) {
-    // 写同步（ping-pong）：写前 wait、用后 set、循环边界 set/wait
-    auto waitOpForWrite = ...;  // 在 transferOp 之前
-    auto setOpForWrite  = ...;  // 在 consumerEndOp 之后
-    auto setOpForStart  = ...;  // 在 mainLoopOp 之前
-    auto waitOpForEnd   = ...;  // 在 mainLoopOp 之后
+  if (dep.reuseStartEnd) {
+    // 本次更新：flag 被跨 region 复用 → 补一对 start/end 边界同步
+    // （循环开始前 set、循环结束后 wait），隔离上一个 region 的残留信号
+    builder.setInsertionPoint(loopStartBound);
+    auto setOpForStart = builder.create<SyncBlockSetOp>(...);
+    builder.setInsertionPointAfter(loopEndBound);
+    auto waitOpForEnd = builder.create<SyncBlockWaitOp>(...);
+    // 传播 subBlockId + 打 analyze flag 标 + E2 注册 set->wait
+    flagIdReuseManager.insertRelationBetweenSetAndWait(setOpForStart, waitOpForEnd);
+    return;
+  }
 
-    attachAnalyzeFlagIdTag(六个 op 全部打标);      // 本次更新：统一打标
+  if (loopStartBound || loopEndBound) {
+    // 主循环内的写同步（ping-pong）：写前 wait、用后 set、循环边界 set/wait
+    auto waitOpForWrite = ...;  // 在 transferOp 之前
+    auto setOpForWrite  = ...;  // 在 insertPoint.consEnd 之后
+    auto setOpForStart  = ...;  // 在 loopStartBound 之前
+    auto waitOpForEnd   = ...;  // 在 loopEndBound 之后
+
+    attachAnalyzeFlagIdTag(六个 op 全部打标);      // 统一打标
     // E2: 注册全部三组 set->wait 配对（读、写、循环边界）
     flagIdReuseManager.insertRelationBetweenSetAndWait(setOpForRead, waitOpForRead);
     flagIdReuseManager.insertRelationBetweenSetAndWait(setOpForWrite, waitOpForWrite);
@@ -352,24 +372,43 @@ void InterCoreTransferAndSyncPass::insertInterCoreSync(
 ```
 
 - **读同步**：生产者写完 set，消费者读取前 wait；
-- **写同步**（仅主循环内）：生产者写新数据前 wait（等消费者用完旧数据），消费者用完 set。这就是 **ping-pong 双缓冲同步**；
-- E2/E4 关系边与 `kAnalyzeFlagId` 打标是为 flag 复用分析准备的（详见 03 篇）。
+- **写同步**（主循环内）：生产者写新数据前 wait（等消费者用完旧数据），消费者用完 set。这就是 **ping-pong 双缓冲同步**；
+- **本次更新新增 `dep.reuseStartEnd` 分支**：当 flag 被跨循环 region 复用（`SyncAnalysis` 标记），光有读写同步不够，还必须在 `loopStartBound` 前 set、`loopEndBound` 后 wait，用边界同步把"上一个 region 的残留信号"隔离掉；`loopStartBound`/`loopEndBound` 由 `processDependencies` 开头的 `findLoopRange(module)` 计算。否则同一 flag 在多个 region 间复用时，前一个 region 的 wait 可能被后一个 region 误消费，造成同步串扰；
+- E2/E4 关系边与 `kAnalyzeFlagId` 打标是为 flag 复用分析准备的（详见 03/08 篇）。
 
 ### 3.15 insertMemDepSync：内存依赖同步（L1145-L1337）
 
 ```cpp
 void InterCoreTransferAndSyncPass::insertMemDepSync(
-    ..., Operation *producerOp, Operation *consumerOp, int flag, ...,
-    bool isCubeToVector, FlagIdReuseManager &flagIdReuseManager) {
+    OpBuilder &builder, DependencyInfo &dep,             // 本次更新：签名改为 dep
+    TransferSyncInsertPoint &insertPoint, int flag,      // + insertPoint
+    Location loc, bool isCubeToVector, FlagIdReuseManager &flagIdReuseManager) {
   hivm::PIPE srcPipe = isCubeToVector ? PIPE_FIX : PIPE_MTE3;
   hivm::PIPE dstPipe = PIPE_MTE2;
-  // producerOp 之后 set（srcCore），consumerOp 之前 wait（dstCore）
+  // insertPoint.prodEnd 之后 set（srcCore），insertPoint.consStart 之前 wait（dstCore）
+
+  if (hasMemDepSyncWhitelistKernel(module)) {
+    // 本次更新：白名单 kernel 且依赖在循环内（dep.loopDepth）时，
+    // 补写同步 + 循环区间的 start/end 边界同步对
+    if (dep.loopDepth) {
+      builder.setInsertionPoint(insertPoint.prodStart);
+      auto waitOpForWrite = builder.create<SyncBlockWaitOp>(...);
+      builder.setInsertionPointAfter(insertPoint.consEnd);
+      auto setOpForWrite = builder.create<SyncBlockSetOp>(...);
+      builder.setInsertionPoint(loopStartBound);
+      auto setOpForStart = builder.create<SyncBlockSetOp>(...);
+      builder.setInsertionPointAfter(loopEndBound);
+      auto waitOpForEnd = builder.create<SyncBlockWaitOp>(...);
+      // 打 analyze flag 标 + E2 注册 set->wait
+    }
+  }
   attachAnalyzeFlagIdTag(setOp); attachAnalyzeFlagIdTag(waitOp);
   flagIdReuseManager.insertRelationBetweenSetAndWait(setOp, waitOp);  // E2
 }
 ```
 
-- 内存依赖固定经 `PIPE_MTE2`（搬运引擎）同步，保证跨核 load/store 顺序。
+- 内存依赖固定经 `PIPE_MTE2`（搬运引擎）同步，保证跨核 load/store 顺序；
+- **本次更新**：`insertMemDepSync` 的插入点从散落的 `producerStartOp/producerEndOp/consumerStartOp/consumerEndOp` 收敛为 `insertPoint`；白名单 kernel（`hasMemDepSyncWhitelistKernel`）下，若依赖带 `dep.loopDepth`（处于循环内），重建写同步 + 循环 start/end 边界同步（同样的复用隔离思路）。
 
 ### 3.16 C→V direct store 三件套（L1376-L1521，新增）
 
@@ -454,55 +493,54 @@ static std::optional<hivm::PIPE> getCopyPipeForAnalyze(hivm::CopyOp copyOp);
 
 ### 3.19 三个 handle 函数（L1574-L1954）
 
+> **main-dev 签名更新**：三个 handle 函数都改用 `TransferSyncInsertPoint insertPoint`（替代 `prodStart/prodEnd/consStart/consEnd` 四个局部变量），且 flag id 改为直接取 `dep.flagId`（由 `DataDependencyAnalysis::analyzeSyncReuse` 预分配），**不再调用 `flagManager.acquireId()`**。`insertVectorToCubeTransfer` / `insertCubeToVectorTransfer` 若返回 null 则直接 `failure()`。
+
 ```cpp
 handleVectorToCube(...)   // 处理一条 V→C 依赖：
   normalizedVal = ndnzValueMapping[dep.value]                    // 归一化结果
-  [prodStart, prodEnd] / [consStart, consEnd] = getBlockStartEnd(...)
-  // 精确化插入点（新增）：
+  insertPoint.prodStart/prodEnd/consStart/consEnd = getBlockStartEnd(...)
+  // 精确化插入点：
   if (dep.consumerBlockId == dep.iniConsumerBlockId)
-    consStart = analyzeConsumerReadInsertPoint(srcValue, ...);    // wait 贴近真实读点
+    insertPoint.consStart = analyzeConsumerReadInsertPoint(srcValue, ...);  // wait 贴近真实读点
   if (dep.iniProducerBlockId == dep.producerBlockId) {
-    prodEnd = getCopyPointBeforeStore(...);                       // copy 避开 store
-    // sub-block 修正（本次更新）：源 op 若带 sub_block 标记，
+    insertPoint.prodEnd = getCopyPointBeforeStore(...);                    // copy 避开 store
+    // sub-block 修正：源 op 若带 sub_block 标记，
     //   prodEnd 取源 op 所在子块的末尾（归一化 copy 落在子块内而非子块外）
-    if (srcDefOp 带 subBlockId) prodEnd = getSubBlockStartEnd(srcDefOp).second;
+    if (srcDefOp 带 subBlockId) insertPoint.prodEnd = getSubBlockStartEnd(srcDefOp).second;
   }
-  transferOp = insertVectorToCubeTransfer(...)
-  flagId = flagManager.acquireId()
+  transferOp = insertVectorToCubeTransfer(...)                  // 现在传 insertPoint
+  flagId = dep.flagId                                           // 本次更新：取预分配 id
   // 插入传输后重新取块端点（块内多了新 op），再精确化 wait 点：
-  newConsStart = getConsumerWaitPoint(transferIndex);
-  insertInterCoreSync(builder, transferOp, newConsStart, newConsEnd, flagId, ...)
+  insertPoint.consStart = getConsumerWaitPoint(transferIndex);
+  insertInterCoreSync(builder, transferOp, dep, insertPoint, flagId, ...)
   transferIndex++
 
 handleCubeToVector(...)   // 处理一条 C→V 依赖：
-  AnalyzeSplittedIf(dep)                            // 新增：识别 split-if 场景，填充 dep.isSplitedIf / realValue
-  // sub-block 修正（本次更新）：若消费端真实读取点带 sub_block 标记，
-  //   consStart 收敛到该子块的起点、newConsEnd 收敛到子块终点
-  //   （同步区间与子块对齐，避免跨子块误同步）
+  AnalyzeSplittedIf(dep)                            // 识别 split-if 场景，填充 dep.isSplitedIf / realValue
+  // sub-block 修正：若消费端真实读取点带 sub_block 标记，
+  //   consStart 收敛到该子块的起点、consEnd 收敛到子块终点
   consumerPoint = analyzeConsumerReadInsertPoint(srcValue, iniConsumerBlockId);
   if (consumerPoint && getSubBlockId(consumerPoint)) {
-    consStart   = getSubBlockStartEnd(consumerPoint).first;
-    newConsEnd  = getSubBlockStartEnd(consumerPoint).second;
+    insertPoint.consStart   = getSubBlockStartEnd(consumerPoint).first;
   }
   // split-if 场景下（源值来自被 kSplittedIf 标记的 op）：
   //   prodEnd 直接指到 realValue（split-if 内真正 yield 出来的 matmul）的 defining op
   //   consStart 用 analyzeConsumerReadInsertPoint 精确到真实读取点
   transferOp = insertCubeToVectorTransfer(...)
-  flagId = flagManager.acquireId()
-  bool isStoreDirectly = isStoreDirectlyInUserChain(consumedDataOp->getResult(0));  // 新增
+  flagId = dep.flagId                                           // 本次更新：取预分配 id
+  bool isStoreDirectly = isStoreDirectlyInUserChain(consumedDataOp->getResult(0));
   if (dep.isSplitedIf) {
     // 同步点修正：wait 插到真实读取点，且 set/wait 区间截止到 yield 之前的那个 op
-    // （getOpBeforeYield 返回 block 终结符的前一个 op），避免同步越过 yield
-    newConsStart = getConsumerWaitPoint(transferIndex);
-    newConsEnd   = getOpBeforeYield(newconsumerPoint);
+    insertPoint.consStart = getConsumerWaitPoint(transferIndex);
+    insertPoint.consEnd   = getOpBeforeYield(newconsumerPoint);
   }
   insertInterCoreSync(..., isStoreDirectly)                       // 影响 pipe 配置
 
 handleMemoryDependency(...)  // 处理一条内存依赖：
   if (isOuterLayerDependency(...)) return success();  // 跳过外层依赖（内层已覆盖）
-  attachMemCrossDeps / attachCrossCoreDeps            // 给原 op 打跨核标记（新增）
-  flagId = flagManager.acquireId()
-  insertMemDepSync(...)
+  attachMemCrossDeps / attachCrossCoreDeps            // 给原 op 打跨核标记
+  flagId = dep.flagId                                 // 本次更新：取预分配 id
+  insertMemDepSync(builder, dep, insertPoint, flagId, ...)
 ```
 
 ### 3.20 C→C 传输：handleCubeToCube（L1728-L1896，本次更新：块间/块内区分）

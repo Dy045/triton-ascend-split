@@ -144,8 +144,8 @@ collectDepsByGroup(Operation *rootOp, const char *attrName,
 static int buildCrossCoreProducerConsumerMapping(
     llvm::DenseMap<int, SmallVector<std::pair<Operation *, int>>> &depsByGroup,
     ConsumerProducerMap &result) {
-  for (auto &groupEntry : depsByGroup) {
-    auto &ops = groupEntry.second;
+  for (int group : sortedGroupIds(depsByGroup)) {
+    auto &ops = depsByGroup[group];
 
     SmallVector<Operation *> producers;
     SmallVector<Operation *> consumers;
@@ -173,6 +173,8 @@ static int buildCrossCoreProducerConsumerMapping(
 ```
 
 **要点**：按 group 把 ops 分成 producers/consumers（去重），然后**每个 consumer 追加一份该 group 的 producers 列表**。若一个 consumer 同时出现在多个 group，`result[consumer]` 就有多个内层列表——这正是 `ConsumerProducerMap`（外层 consumer、内层每 group 一份 producers）的结构由来。
+
+**main-dev 更新点**：遍历从 `for (auto &groupEntry : depsByGroup)` 改为 `for (int group : sortedGroupIds(depsByGroup))`。`depsByGroup` 是 `DenseMap`，其迭代顺序由哈希桶决定、**不保证按 group id 有序**，会导致每个 consumer 的 producers 列表顺序在不同编译运行间漂移，进而影响下游依赖组编号与 SSBuffer 槽位的确定性。新增的 `sortedGroupIds` 把 group id 收集后 `llvm::sort`，保证跨核/核内两条映射都按 group id 升序产出（producer 列表顺序稳定）。
 
 ### 3.4 跨核主循环过滤：filterMemCrossCoreDepsByMainLoop（L234-L304）
 
@@ -262,7 +264,7 @@ static int buildIntraCoreProducerConsumerMapping(
     llvm::DenseMap<int, SmallVector<std::pair<Operation *, int>>> &depsByGroup,
     llvm::DenseMap<Operation *, SmallVector<Operation *>> &result,
     Operation *mainLoop = nullptr) {
-  for (auto &groupEntry : depsByGroup) {
+  for (int group : sortedGroupIds(depsByGroup)) {
     // producers：全部保留
     // consumers：mainLoop != nullptr 时用 isConsumerInMainLoop 过滤
     for (auto &opRole : ops) {
@@ -432,27 +434,25 @@ static int detectCycle(ControlFlowConditionInfo *info) {
 ```cpp
 static int collectFlowOptIfOpPairs(ModuleOp module,
                                    ControlFlowConditionInfo *info) {
-  // Step 1: 收集 DAG 全部节点
+  // Step 1: 收集 DAG 全部节点，同时计算入度（cross/intra 每条边 +1）
   llvm::DenseSet<scf::IfOp> allNodes;
+  llvm::DenseMap<scf::IfOp, int> inDegree;
   for (auto &entry : info->ifBlockDAG) {
     allNodes.insert(entry.first);
-    for (auto &edge : entry.second)
+    for (auto &edge : entry.second) {
       allNodes.insert(edge.first);
+      inDegree[edge.first]++;
+    }
   }
 
-  // Step 2: 计算入度（cross/intra 每条边都 +1）
-  llvm::DenseMap<scf::IfOp, int> inDegree;
-  for (auto &entry : info->ifBlockDAG)
-    for (auto &edge : entry.second)
-      inDegree[edge.first]++;
-
-  // Step 3: 入度 0 即起点
+  // Step 2: 入度 0 即起点，按 module 顺序（walk 保证确定性）
   llvm::SmallVector<scf::IfOp> startNodes;
-  for (auto node : allNodes)
-    if (inDegree.lookup(node) == 0)
-      startNodes.push_back(node);
+  module.walk([&](scf::IfOp ifOp) {
+    if (allNodes.contains(ifOp) && inDegree.lookup(ifOp) == 0)
+      startNodes.push_back(ifOp);
+  });
 
-  // Step 4: 逐起点 DFS 求最大深度，深度恰 = 3 的节点成对
+  // Step 3: 逐起点 DFS 求最大深度，深度恰 = 3 的节点成对
   constexpr int targetDepth = 3;
   for (scf::IfOp start : startNodes) {
     llvm::DenseMap<scf::IfOp, int> depth;
@@ -494,6 +494,8 @@ static int collectFlowOptIfOpPairs(ModuleOp module,
 - **深度计分规则**：跨核边 +1、核内边 +0——跨核一次 = 一次完整的 buffer 轮换周期，核内同步不增加流水级数；
 - **深度取"所有路径的最大值"**（非首次到达值），保证从起点到节点存在一条恰好 3 级跨核链即命中；
 - 命中节点 → `flowOptIfOpPairs[target] = start`：距离 3 级的这对 if 启动流水线重叠优化（`UpdateConditionInfo` 据此跳过同步、提前 overlap）。
+
+**main-dev 更新点**：入度计算合并进收集节点的同一遍循环（少一轮 DAG 遍历）；**起点从 `for (auto node : allNodes)`（DenseSet 无序）改为 `module.walk` 按 module 顺序填充**，保证多个起点的 DFS 顺序稳定——否则 `flowOptIfOpPairs` 里重叠对的 key 覆盖顺序随哈希桶漂移，影响下游条件构造的可复现性。
 
 ---
 

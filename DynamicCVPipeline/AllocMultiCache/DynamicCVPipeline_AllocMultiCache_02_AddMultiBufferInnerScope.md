@@ -395,7 +395,9 @@ static void buildAfterRegion(scf::WhileOp oldWhile, OpBuilder &ab, Location al,
 static void insertWhileCounterOps(const MainLoop &mainLoop) {
   // 找 counter 消费 op 的 block_id（第一个用 iterCounter 的 op）
   // 在 doBlock 里找最后一个带该 block_id 的 op，插到其后：
-  Value one = ConstantIntOp(1, bitWidth);
+  auto counterType = mainLoop.iterCounter.getType();
+  Value one = builder.create<arith::ConstantOp>(
+      loc, builder.getIntegerAttr(counterType, 1));   // 兼容 i32 / index 类型（main-dev 更新）
   Value nextCounter = AddIOp(counter, one);
   // yield 中 counterIterArg 占位替换为 nextCounter
   ...
@@ -406,6 +408,7 @@ static void insertWhileCounterOps(const MainLoop &mainLoop) {
 - `buildBeforeRegion`（L1834-L1862）：克隆旧 before 的所有非 condition op（`IRMapping` 映射旧参数到新 iterArgs），重建 `scf.condition`（操作数 + 追加 counter 前向参数）；
 - `buildAfterRegion`（L1867-L1895）：克隆旧 after 的非 yield op，yield 操作数**追加 counterIterArg 占位**（真正的 `+1` 由 `insertWhileCounterOps` 稍后插入替换）；
 - `insertWhileCounterOps`（L1951-L2015）：必须**在 `processTensorDependencies` 之后**执行——此时 counter 的消费 op（轮询 if 链）已生成，才能定位 counter 的 block_id 归属；
+- **main-dev 更新点**：`one` 常量的创建从 `arith::ConstantIntOp(loc, 1, getIntOrFloatBitWidth())` 改为 `arith::ConstantOp(loc, getIntegerAttr(counterType, 1))`——因为 while 注入的 `iterCounter` 可能被上游化成 **index 类型**，而 index 类型没有 `getIntOrFloatBitWidth()`（会查询不存在的位宽）。`getIntegerAttr` 对整型和 index 都兼容，统一用它避免类型不匹配；
 - 计数更新 `kIterCounter` 标记，op 继承消费块 block_id。
 
 ### 3.11 核心编排：addInnerMultiBuffer（L2017-L2159）

@@ -216,23 +216,29 @@ void UpdateConditionInfoPass::collectDependencyBuffers(
     return WalkResult::advance();
   });
 
-  // 核内：逐主循环，同一循环内 group 编连续索引
+  // 核内：逐主循环，同一循环内 group 按 loopOp 内 walk 顺序编连续索引
   for (Operation *loopOp : mainLoopOps) {
-    if (info->intraCoreDependentMap.count(loopOp)) {
-      auto &loopDeps = info->intraCoreDependentMap[loopOp];
-      DenseMap<int, ...> intraCoreBuffers;
-      int intraCoreIdx = 0;
-      for (auto &entry : loopDeps) {
-        intraCoreBuffers[intraCoreIdx][entry.first] = entry.second;
-        intraCoreIdx++;
-      }
-      intraCoreBuffersMap[loopOp] = intraCoreBuffers;
-    }
+    auto depsIt = info->intraCoreDependentMap.find(loopOp);
+    if (depsIt == info->intraCoreDependentMap.end())
+      continue;
+    auto &loopDeps = depsIt->second;
+    DenseMap<int, ...> intraCoreBuffers;
+    int intraCoreIdx = 0;
+    loopOp->walk([&](Operation *op) {
+      auto entryIt = loopDeps.find(op);
+      if (entryIt == loopDeps.end())
+        return;
+      intraCoreBuffers[intraCoreIdx][entryIt->first] = entryIt->second;
+      intraCoreIdx++;
+    });
+    intraCoreBuffersMap[loopOp] = std::move(intraCoreBuffers);
   }
 }
 ```
 
 **要点**：把 InitDependentMap 的映射（consumer 键）转成**按 group 编号索引**的结构。编号顺序决定 SSBuffer 槽位（跨核）与 `innerDepConds` iter_arg（核内）的一一对应，**必须与 InitDependentMap/UpdateLoopOps 的分配顺序一致**（都是 walk / map 顺序，确定性保证）。
+
+**main-dev 更新点**：核内部分从 `if (...count(loopOp)) { ... for (auto &entry : loopDeps) ... }` 改为 `find` + `loopOp->walk`。旧代码按 `loopDeps`（`DenseMap`，consumer 键无序）迭代编号，编号顺序随哈希桶漂移；新代码改成**沿 `loopOp` 内 op 的 walk 顺序**去 `loopDeps` 反查，使 group 编号与 op 在 IR 中的物理顺序对齐，下游 `buildIdxToVarMap`/`innerDepConds` 的对应关系更稳定可复现。
 
 ### 3.5 控制变量分配：buildIdxToVarMap（L355-L395）
 
@@ -249,8 +255,14 @@ int UpdateConditionInfoPass::buildIdxToVarMap(
     return FAILED;  // 计数变量不够
   }
 
-  for (const auto &entry : intraCoreBuffers) {
-    int idx = entry.first;
+  // main-dev：intraCoreBuffers 仍作查表使用，组顺序单独存 groupIndices
+  SmallVector<int> groupIndices;
+  groupIndices.reserve(intraCoreBuffers.size());
+  for (const auto &entry : intraCoreBuffers)
+    groupIndices.push_back(entry.first);
+  llvm::sort(groupIndices);
+
+  for (int idx : groupIndices) {
     int argIdx = innerDepIndices[varIdx];   // 第 varIdx 个依赖组 -> 第 argIdx 个 iter_arg
     if (argIdx < 0 || argIdx >= iterArgNum) return FAILED;
     idxToVar[idx] = regionIterArgs[argIdx]; // 依赖组索引 -> 控制变量
@@ -261,6 +273,8 @@ int UpdateConditionInfoPass::buildIdxToVarMap(
 ```
 
 **要点**：核内依赖组索引（`intraCoreBuffers` 的 key）到 loop iter_arg 的映射，靠 `innerDepConds[loopOp]`（UpdateLoopOps 记录的新 iter_arg 索引列表）按序对应。**一个依赖组一个控制变量**。
+
+**main-dev 更新点**：组遍历前新增 `groupIndices` 收集并 `llvm::sort`——`intraCoreBuffers` 是 `DenseMap<int, ...>`，直接迭代 key 顺序由哈希桶决定；排序后 `idxToVar` 与 `innerDepIndices[varIdx]` 的对应顺序稳定，避免依赖组编号漂移导致控制变量分配错位。
 
 ### 3.6 输入/输出依赖组分析：getInputOutputValues（L439-L527）
 
@@ -297,14 +311,18 @@ int UpdateConditionInfoPass::getInputOutputValues(
     return WalkResult::advance();
   });
 
-  // DenseSet -> SmallVector（确定性输出）
+  // DenseSet -> SmallVector（确定性输出 + main-dev 显式排序）
   crossCoreInputValues.assign(crossCoreInputSet.begin(), crossCoreInputSet.end());
   ... 同 crossCoreOutput / intraCoreInput / intraCoreOutput ...
+  llvm::sort(crossCoreInputValues);
+  llvm::sort(crossCoreOutputValues);
+  llvm::sort(intraCoreInputValues);
+  llvm::sort(intraCoreOutputValues);
   return UPDATE_CONDITION_INFO_SUCCESS;
 }
 ```
 
-**要点**：if 的同步条件由它**读哪些组**（输入）与**写哪些组**（输出）决定。反查表让 O(1) 判断任意 op 的组归属；一个 op 可同时是多个组的 consumer/producer。DenseSet 无序但迭代确定性（LLVM 保证相同插入序下输出稳定）。
+**要点**：if 的同步条件由它**读哪些组**（输入）与**写哪些组**（输出）决定。反查表让 O(1) 判断任意 op 的组归属；一个 op 可同时是多个组的 consumer/producer。四个结果集合再显式 `llvm::sort`（main-dev 新增），保证输入/输出 group 索引列表有序，使后续构造的 if 条件顺序可复现，而非依赖 `DenseSet` 的哈希桶迭代序。
 
 ### 3.7 核间条件总装：setCrossCoreCondition（L783-L855）
 
@@ -570,8 +588,8 @@ int UpdateConditionInfoPass::buildTensorIterArgIfOpVarMap(Operation *loopOp) {
 
   auto &depsVec = info->tensorIterArgDepsMap[loopOp];
   auto &indicesMap = info->tensorIterArgIndicesMap[loopOp];
-  llvm::DenseMap<scf::IfOp, llvm::DenseSet<Value>> producerVars;
-  llvm::DenseMap<scf::IfOp, llvm::DenseSet<Value>> consumerVars;
+  llvm::DenseMap<scf::IfOp, SetVector<Value>> producerVars;
+  llvm::DenseMap<scf::IfOp, SetVector<Value>> consumerVars;
 
   for (auto &depEntry : depsVec) {
     Value origIterArg = depEntry.iterArg;
@@ -580,12 +598,12 @@ int UpdateConditionInfoPass::buildTensorIterArgIfOpVarMap(Operation *loopOp) {
     SmallVector<int> &argIndices = indicesMap[origIterArg];
     if (relation.consumers.size() != argIndices.size()) return FAILED;
 
-    // consumer -> 各自独立的计数变量（一一对应）
-    llvm::DenseMap<scf::IfOp, Value> consumerToVar;
+    // consumer -> 各自独立的计数变量（一一对应，SmallVector 保持插入序）
+    SmallVector<std::pair<scf::IfOp, Value>> consumerToVar;
     for (size_t i = 0; i < relation.consumers.size(); ++i) {
       Value var;
       if (getLoopRegionIterArg(loopOp, argIndices[i], var) == FAILED) return FAILED;
-      consumerToVar[relation.consumers[i]] = var;
+      consumerToVar.push_back({relation.consumers[i], var});
     }
 
     // producer 关联所有依赖它的 consumer 的变量（作为其"产出状态"）
@@ -633,6 +651,8 @@ void UpdateConditionInfoPass::collectTensorIterArgOutputConditions(...) {
 ```
 
 **要点**：tensor 跨迭代依赖用**精确判据**（`==1`/`==0`）而非区间判据——因为一个 producer if 对应多个 consumer，张量缓冲只能在"刚好生产 1 份待消费"时读、在"本轮无人待消费"时写。生产者 if 的产出变量 = 所有依赖它的 consumer 的计数变量（producer 必须在所有 consumer 都消费完上一轮后才能再产）。
+
+**main-dev 更新点**：`producerVars`/`consumerVars` 从 `DenseSet<Value>` 改为 `SetVector<Value>`、`consumerToVar` 从 `DenseMap<scf::IfOp, Value>` 改为 `SmallVector<std::pair<scf::IfOp, Value>>`，`usedVarsSet` 也从 `DenseSet` 换 `SetVector`。`SetVector` 是"插入序的有序集合"（内部 DenseSet 判重 + vector 保序），使 tensor 依赖变量、以及每个 if 用到的控制变量集合的**遍历顺序可复现**——在 `usedVarsSet` 用于剔除重复变量、`collectTensorIterArg*Conditions` 逐 var 生成条件时，顺序不稳定会导致最终 if 条件的 And 表达式排列漂移。这是 main-dev 对"全流水线条件构造确定性"的系统性收敛之一。
 
 ### 3.13 flowOpt 条件：setFlowOptCondition（L1135-L1206）
 

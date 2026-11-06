@@ -13,6 +13,8 @@
 
 **本次更新要点**：新增了 `scf.while` 循环的支持（对应 Triton 中 `while` 语句生成的 IR），并统一处理了所有控制流终结符（`scf.yield` 和 `scf.condition`）。
 
+**本次 main-dev 拉取更新要点**：新增**循环深度标记**步骤——在给控制流 op 分配完 `block_id` 之后，再单独走一遍 `PreOrder` 遍历，对每个 `scf.for` / `scf.while` 调用 `setOpLoopDepth` 打上 `ssbuffer.loop_depth` 属性。这个深度值是后续 `SyncAnalysis`（08 篇）做循环维度 flag 复用分析时的关键输入（`getOpLoopDepth` 读取它）。
+
 ---
 
 ## 二、关键背景概念
@@ -124,7 +126,22 @@ void AddBlockIdForControlOpsPass::runOnOperation() {
 
 **为什么终结符要特殊处理？** 因为终结符本身不"计算"，但它的操作数来源（yield/condition 转发的 value）可能定义在另一个核的块中。给终结符分配与父控制流一致的 block_id，是为了在依赖分析中能正确追溯终结符与控制流的归属关系——`DataDependencyAnalysis` 中的 `analyzeExternalOutputs` 会用 `getCoreTypeWithIndex(user, outputIndex)` 读取终结符上的 core_type 来判断跨核依赖。
 
-### 3.5 Pass 创建函数（L87-L96）
+### 3.5 Step 3：给 for/while 打循环深度标记（L85-L89，本次新增）
+
+```cpp
+  module->walk<WalkOrder::PreOrder>([](Operation *op) {
+    if (isa<scf::ForOp, scf::WhileOp>(op)) {
+      setOpLoopDepth(op);
+    }
+  });
+```
+
+- 这是在第一个 `module.walk`（分配 block_id）**之后**、打印 exit 日志之前的第二个独立遍历；
+- 用 `WalkOrder::PreOrder` 保证**先访问外层 op 再访问内层 op** 的父-子顺序；
+- 只对 `scf.for` / `scf.while` 调用 `setOpLoopDepth`（定义在 `SplitDataflow/Utils.cpp`）：从该 op 沿 `getParentOp()` 一路向上数嵌套的 for/while 个数，得到 `loopDepth`，写成 `ssbuffer.loop_depth` 整型属性；
+- **为什么不是合并进第一个 walk**：第一个 walk 里既要跳过已有 block_id 的 op、又要处理终结符，逻辑混杂；循环深度是独立的、与 block_id 无关的标注，单独走一遍更清晰，且 `PreOrder` 的父先行顺序对"外深内浅"的计数是必要的（虽然 `setOpLoopDepth` 内部自己会重新从下往上数，父先行更多是保证遍历语义一致）。
+
+### 3.6 Pass 创建函数（L91-L96）
 
 ```cpp
 std::unique_ptr<OperationPass<ModuleOp>> createAddBlockIdForControlOpsPass() {
@@ -146,6 +163,8 @@ std::unique_ptr<OperationPass<ModuleOp>> createAddBlockIdForControlOpsPass() {
    a. 已有 block_id → 跳过
    b. 是 scf.for / scf.if / scf.while → 分配 ++maxBlockId
    c. 是控制流终结符（yield@if/while 或 condition@while）→ 复用父 op 的 id，或分配新 id
+4. 再次 PreOrder 遍历所有 op：
+   是 scf.for / scf.while → setOpLoopDepth 打上 loop_depth 标记
 ```
 
 复杂度：O(N)，N 为 module 中 op 总数。

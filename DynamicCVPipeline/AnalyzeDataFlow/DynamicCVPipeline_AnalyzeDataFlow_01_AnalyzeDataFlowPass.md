@@ -65,10 +65,8 @@ if (failed(runPipeline(pm, module))) {                  // 任一子 pass 失败
 
 ```cpp
 static constexpr llvm::StringLiteral interceptrFunc[]{
-    "kernel_sdpa_bwd_kv", "flash_varlen_fwd_kernel", "_sparse_decode_kernel",
-    "_sparse_decode_model1_kernel", "sparse_flash_attention_grad_kernel",
-    "flex_attention_backward_dkdv_kernel",
-    "flex_attention_backward_dkdv_kernel_tasklist", "chunkwise_bwd_kernel_dhg",
+    "kernel_sdpa_bwd_kv", "_sparse_decode_kernel",
+    "_sparse_decode_model1_kernel", "fused_chunk_fwd_kernel",
 };
 
 static LogicalResult verifyFuncNames(ModuleOp module) {
@@ -91,7 +89,9 @@ void AnalyzeNamePass::runOnOperation() {
 }
 ```
 
-**要点**：8 个黑名单 kernel（sdpa bwd、flash varlen、sparse decode、flex attention bwd 等）经过前期验证**不适合 CV 流水线**（多为已手工优化过的 kernel），直接 `ERRCODE_IGNORED` 回退。
+**要点**：黑名单 kernel 经过前期验证**不适合 CV 流水线**（多为已手工优化过的 kernel），直接 `ERRCODE_IGNORED` 回退。
+
+**本次 main-dev 拉取更新要点**：黑名单从 8 个收敛为 4 个——移除了 `flash_varlen_fwd_kernel`、`sparse_flash_attention_grad_kernel`、`flex_attention_backward_dkdv_kernel`、`flex_attention_backward_dkdv_kernel_tasklist`、`chunkwise_bwd_kernel_dhg`（这 5 个 kernel 在 main-dev 上已被验证能正确走 CV 流水线，无需再拦截），新增了 `fused_chunk_fwd_kernel`（chunk 融合前向 kernel，判定为不适合流水线）。
 
 ### 3.2 AnalyzeScopePass：scope 主循环形态审计（AnalyzeScope.cpp L199-L227）
 
@@ -131,7 +131,19 @@ static bool checkTransferInteraction(mlir::Operation *op) {
 **检查 3：主循环不能是"单向 copy/fixpipe" `isMainLoopOnlyCopyOrFixpipe`（L147-L197）**：
 
 ```cpp
-// main_loop id → (countCopy, countFixpipe)
+// main-dev 新增：判断一个 FixpipeOp 的目的地址空间是否为 UB（Unified Buffer）
+static bool isFixpipeToUB(Operation *op) {
+  auto fixpipeOp = dyn_cast<hivm::FixpipeOp>(op);
+  if (!fixpipeOp) return false;
+  auto dstType = dyn_cast<MemRefType>(fixpipeOp.getDst().getType());
+  if (!dstType) return false;
+  auto addrSpaceAttr =
+      dyn_cast_or_null<hivm::AddressSpaceAttr>(dstType.getMemorySpace());
+  if (!addrSpaceAttr) return false;
+  return addrSpaceAttr.getAddressSpace() == hivm::AddressSpace::UB;
+}
+
+// main_loop id → (countCopy, countFixpipeToUB)
 llvm::DenseMap<int, std::pair<int, int>> idToCounts;
 module.walk([&](Operation *op) -> WalkResult {
   if (!isa<scf::ForOp, scf::WhileOp>(op)) return advance();
@@ -142,7 +154,7 @@ module.walk([&](Operation *op) -> WalkResult {
   op->walk([&](Operation *innerOp) {
     if (innerOp == op || isa<scf::YieldOp>(innerOp)) return advance(); // 跳过自身和 yield
     if (isa<hivm::CopyOp>(innerOp)) ++counts.first;
-    else if (isa<hivm::FixpipeOp>(innerOp)) ++counts.second;
+    else if (isFixpipeToUB(innerOp)) ++counts.second;  // 只统计写到 UB 的 fixpipe
     return advance();
   });
   return advance();
@@ -154,7 +166,9 @@ for (const auto &entry : idToCounts)
 return true;
 ```
 
-**要点**：`CopyOp` 典型出现在 Vector scope 主循环（v→c 搬运），`FixpipeOp` 典型出现在 Cube scope 主循环（FIXPIPE 量化）。如果每个主循环 id 都**只有单向交互**，说明 CUBE/Vector 之间没有真实的数据往返依赖，流水线无收益；只要有一个 id 同时有 copy 和 fixpipe（双向往返），CV 流水线依然适用。
+**要点**：`CopyOp` 典型出现在 Vector scope 主循环（v→c 搬运），`FixpipeOp`（写到 UB）典型出现在 Cube scope 主循环（FIXPIPE 量化结果落地）。如果每个主循环 id 都**只有单向交互**，说明 CUBE/Vector 之间没有真实的数据往返依赖，流水线无收益；只要有一个 id 同时有 copy 和 fixpipe（双向往返），CV 流水线依然适用。
+
+**本次 main-dev 拉取更新要点**：fixpipe 的计数从"所有 `FixpipeOp`"收窄为"**写到 UB 的 `FixpipeOp`**（新增 `isFixpipeToUB` 判定）。原因是 main-dev 引入 C→C 传输后，`FixpipeOp` 也可能把数据写到 **L1/L0C**（如 `hivm.fixpipe` NZ2NZ 写共享 L1 buffer，供另一个 Cube 块使用），这种 fixpipe 是"Cube↔Cube"的块内/块间直传，**不属于**"Cube↔Vector 往返数据"的范畴，不应计入双向判定。若继续把所有 fixpipe 都算进去，可能把纯 C2C 直传的 kernel 误判为"有双向往返"而错误放行，或反之。只有 fixpipe 落到 UB（Vector 消费端）才代表一次真正的 C→V 数据落地。
 
 ### 3.3 AnalyzeArgsPass：迭代参数跨块使用审计（AnalyzeArgs.cpp L200-L230）
 

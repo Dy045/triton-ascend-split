@@ -18,6 +18,9 @@
    - `transferAttrs`：要求 from/to **同名**且都是控制流 op → 转移**全部**属性；
    - `transferBlockIdToInsertedReplacement`：只要求 from 是控制流 op（**对 to 的类型/名字不设限**）+ to 在 `recentInserts` 中 + 与 from **同 block** → 只转移 `kBlockId`，且不覆盖已有。
 
+**本次 main-dev 拉取更新要点**：
+4. **新增 `BlockIdAwareIfMergePattern` + `guardIfMergePatterns`**：在 canonicalize 前，把 SCF 方言的两个原生 "if 合并" pattern（`CombineIfs` 相邻合并、`CombineNestedIfs` 嵌套合并）用包装类替换掉——合并前先校验两个 `scf.if` 的 `block_id` **必须相同**，不同则拒绝合并。目的是防止 MLIR 原生 canonicalize 把位于**不同计算块**的两个 if 误合并成一个，破坏 CV 流水线按 block_id 划分的块边界（详见 3.2）。
+
 ---
 
 ## 二、核心机制：RewriterBase::Listener
@@ -64,7 +67,82 @@ static bool canTransferAttrs(Operation *from, Operation *to) {
 
 - 关键约束：**只在同类型的控制流 op 之间转移属性**（`from->getName() == to->getName()`）。避免把 `scf.for` 的属性错误地贴到 `scf.if` 上。
 
-### 3.2 PreserveControlAttrsListener（L57-L149）
+### 3.2 BlockIdAwareIfMergePattern / guardIfMergePatterns（L58-L129，本次新增）
+
+```cpp
+class BlockIdAwareIfMergePattern : public OpRewritePattern<scf::IfOp> {
+public:
+  enum class Kind { AdjacentMerge, NestedMerge };
+  BlockIdAwareIfMergePattern(MLIRContext *ctx,
+                             std::unique_ptr<RewritePattern> wrappedPattern,
+                             Kind kind)
+      : OpRewritePattern<scf::IfOp>(ctx, wrappedPattern->getBenefit()),
+        wrappedPattern(std::move(wrappedPattern)), kind(kind) {
+    setDebugName(this->wrappedPattern->getDebugName());        // 继承原 debug 名
+    addDebugLabels(this->wrappedPattern->getDebugLabels());
+    setHasBoundedRewriteRecursion(
+        this->wrappedPattern->hasBoundedRewriteRecursion());
+  }
+
+  LogicalResult matchAndRewrite(scf::IfOp ifOp,
+                                PatternRewriter &rewriter) const override {
+    Operation *otherIf = nullptr;
+    if (kind == Kind::AdjacentMerge) {
+      otherIf = ifOp->getPrevNode();                           // 前一个兄弟 op
+    } else {                                                   // NestedMerge
+      auto nestedOps = ifOp.thenBlock()->without_terminator();
+      if (llvm::hasSingleElement(nestedOps))
+        if (auto nestedIf = dyn_cast<scf::IfOp>(*nestedOps.begin()))
+          otherIf = nestedIf;                                  // 唯一嵌套 if
+    }
+
+    if (otherIf && isa<scf::IfOp>(otherIf) &&
+        ifOp->getAttr(CVPipeline::kBlockId) !=
+            otherIf->getAttr(CVPipeline::kBlockId)) {
+      return rewriter.notifyMatchFailure(
+          ifOp, "cannot merge scf.if operations with different block IDs");
+    }
+
+    return wrappedPattern->matchAndRewrite(ifOp.getOperation(), rewriter);
+  }
+
+private:
+  std::unique_ptr<RewritePattern> wrappedPattern;
+  Kind kind;
+};
+```
+
+```cpp
+struct IfMergePatternGuard {
+  llvm::StringLiteral debugNameSuffix;
+  BlockIdAwareIfMergePattern::Kind kind;
+};
+static constexpr IfMergePatternGuard kIfMergePatternGuards[] = {
+    {"CombineIfs",       BlockIdAwareIfMergePattern::Kind::AdjacentMerge},
+    {"CombineNestedIfs", BlockIdAwareIfMergePattern::Kind::NestedMerge},
+};
+
+static void guardIfMergePatterns(MLIRContext *ctx, RewritePatternSet &patterns) {
+  auto &nativePatterns = patterns.getNativePatterns();
+  for (std::unique_ptr<RewritePattern> &pattern : nativePatterns) {
+    StringRef debugName = pattern->getDebugName();
+    for (const IfMergePatternGuard &guard : kIfMergePatternGuards) {
+      if (!debugName.ends_with(guard.debugNameSuffix)) continue;
+      pattern = std::make_unique<BlockIdAwareIfMergePattern>(
+          ctx, std::move(pattern), guard.kind);   // 用包装类替换原 pattern
+      break;
+    }
+  }
+}
+```
+
+- **动机**：MLIR 原生 SCF canonicalize 会把两个**相邻**（`CombineIfs`，如 if 一个 then 分支里又串一个 if）或**嵌套**（`CombineNestedIfs`，if 的 then 里只有一个 if）的 `scf.if` 合并成一个 if。在 CV 流水线里，这两个 if 可能被 `MarkMainLoop`/`AddBlockIdForControlOps` 分配了**不同的 `block_id`**（属于不同计算块），一旦合并，块边界就没了，后续依赖分析/传输插入的位置全部错乱。
+- **识别手段**：SCF 的这两个合并 pattern 注册在匿名命名空间里，无法按类型直接替换，只能靠 **debug name 后缀**（`CombineIfs` / `CombineNestedIfs`）从 `nativePatterns` 里逐个认出，再用包装类 `unique_ptr` 原地替换（`std::move` 到包装类内部做委托）。
+- **校验逻辑**：包装类先根据 `Kind` 定位"被合并的另一个 if"（`AdjacentMerge` 找 `getPrevNode()`，`NestedMerge` 找 then 区唯一嵌套 if），然后比较两个 if 的 `kBlockId`——**不等就 `notifyMatchFailure` 拒绝合并**；相等才把控制权交还给 `wrappedPattern->matchAndRewrite`。
+- **何时生效**：`guardIfMergePatterns` 在 `populateCanonicalizationPatterns` 之后、`applyPatternsGreedily` 之前被调用（见 3.5），确保本次 canonicalize 全程都对这两个 if 合并 pattern 施加 block_id 守卫。
+- 为什么这个守卫要和 `transferAttrs`（listener 里的属性转移）分开做：后者解决的是"op 被替换后属性丢失"的问题，前者解决的是"本就不该发生的合并被误触发"的问题，两者是**预防（阻止合并）** vs **补救（转移属性）**的关系。
+
+### 3.3 PreserveControlAttrsListener（L128-L220）
 
 ```cpp
 class PreserveControlAttrsListener : public RewriterBase::Listener {
@@ -163,7 +241,7 @@ public:
   3. `to` 已有 `kBlockId` 则不覆盖。
 - 成员 `recentInserts`（L148）：`llvm::SetVector<Operation *>`，去重且保序（`findReplacementOp` 的兜底逻辑依赖插入顺序的逆序遍历）。
 
-### 3.3 populateCanonicalizationPatterns（L151-L160）
+### 3.4 populateCanonicalizationPatterns（L222-L231）
 
 ```cpp
 static void populateCanonicalizationPatterns(MLIRContext *ctx,
@@ -179,7 +257,7 @@ static void populateCanonicalizationPatterns(MLIRContext *ctx,
 
 - 加载所有方言和 op 的 canonicalization patterns，做一次全局 canonicalize。
 
-### 3.4 runOnOperation（L164-L187）
+### 3.5 runOnOperation（L235-L259）
 
 ```cpp
 void mlir::triton::PreserveControlAttrsCanonicalizePass::runOnOperation() {
@@ -189,6 +267,7 @@ void mlir::triton::PreserveControlAttrsCanonicalizePass::runOnOperation() {
 
   RewritePatternSet patterns(&getContext());
   populateCanonicalizationPatterns(&getContext(), patterns);
+  guardIfMergePatterns(&getContext(), patterns);   // 本次新增：给 if 合并 pattern 挂 block_id 守卫
 
   PreserveControlAttrsListener listener;   // 自定义监听器
   GreedyRewriteConfig config;
@@ -211,7 +290,7 @@ void mlir::triton::PreserveControlAttrsCanonicalizePass::runOnOperation() {
 - `FrozenRewritePatternSet`：把 pattern 集冻结（只读），避免贪心过程中修改 pattern 集。
 - 失败时设置 fallback 属性（回退到非优化路径），符合整条 CV pipeline 的兜底约定。
 
-### 3.5 Pass 注册（L189-L204）
+### 3.6 Pass 注册（L264-L273）
 
 ```cpp
 std::unique_ptr<OperationPass<ModuleOp>> createPreserveControlAttrsCanonicalizePass() {
@@ -230,12 +309,14 @@ void registerPreserveControlAttrsCanonicalizePasses() {
 
 ```
 1. 加载所有 dialect/op 的 canonicalization patterns
-2. 创建自定义 Listener（拦截 op 插入/删除/替换事件）
-3. 挂载 Listener 到 GreedyRewriteConfig
-4. applyPatternsGreedily 反复 canonicalize 到 fixpoint
+2. guardIfMergePatterns：给 SCF 的 if 合并 pattern 挂 block_id 守卫（本次新增）
+3. 创建自定义 Listener（拦截 op 插入/删除/替换事件）
+4. 挂载 Listener 到 GreedyRewriteConfig
+5. applyPatternsGreedily 反复 canonicalize 到 fixpoint
    - 控制流 op 被同名新 op 替换 → transferAttrs 转移全部属性
    - 控制流 op 被任意新插入 op（同 block）替换 →
      transferBlockIdToInsertedReplacement 定向转移 block_id
+   - if 合并 pattern 被触发但两个 if block_id 不同 → notifyMatchFailure 拒绝合并
 ```
 
 ---
@@ -259,3 +340,6 @@ void registerPreserveControlAttrsCanonicalizePasses() {
 
 6. **为什么 `notifyOperationReplaced(op, values)` 不能在找不到后继时提前返回？**
    旧逻辑找到 `findReplacementOp` 的同名候选就 return，找不到就什么都不做。新逻辑即使全属性转移失败，也要遍历每个 replacement value 的 defining op 尝试 `block_id` 转移——两套机制的判定条件不同（同名 vs 同 block+新插入），前者失败不代表后者也失败。
+
+7. **为什么需要 `BlockIdAwareIfMergePattern`，属性转移（Listener）还不够吗？**
+   两者的职责不同：Listener 的 `transferAttrs`/`transferBlockIdToInsertedReplacement` 是**补救**——op 已经被替换/消解后，把属性从旧 op 抢救到新 op；`BlockIdAwareIfMergePattern` 是**预防**——在 SCF 原生 if 合并 pattern 真正触发**之前**，发现两个 if 的 `block_id` 不同就直接拒绝合并。被合并的两个 if 属性虽然能被转移，但它们各自承载的"块边界"语义已经因为合并而丢失（两个块变成一个块），这是属性转移救不回来的，必须靠前置守卫阻止。识别手段上，因为 SCF 这两个合并 pattern 在匿名命名空间里，无法按类型引用，只能用 debug 名后缀（`CombineIfs`/`CombineNestedIfs`）去 `nativePatterns` 里匹配后原地包一层。

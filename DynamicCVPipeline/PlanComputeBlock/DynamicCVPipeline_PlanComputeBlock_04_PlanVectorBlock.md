@@ -1,6 +1,6 @@
 # DynamicCVPipeline 子 Pass 逐行讲解：PlanVectorBlockPass
 
-> 源码文件：[`third_party/ascend/lib/DynamicCVPipeline/PlanComputeBlock/PlanVectorBlockPass.cpp`](../../../third_party/ascend/lib/DynamicCVPipeline/PlanComputeBlock/PlanVectorBlockPass.cpp)（669 行）
+> 源码文件：[`third_party/ascend/lib/DynamicCVPipeline/PlanComputeBlock/PlanVectorBlockPass.cpp`](../../../third_party/ascend/lib/DynamicCVPipeline/PlanComputeBlock/PlanVectorBlockPass.cpp)（677 行）
 >
 > 头文件：[`third_party/ascend/include/DynamicCVPipeline/PlanComputeBlock/Passes.h`](../../../third_party/ascend/include/DynamicCVPipeline/PlanComputeBlock/Passes.h)
 >
@@ -41,7 +41,7 @@
 
 ## 三、逐行讲解
 
-### 3.1 主流程：`runOnOperation`（L626-L660）
+### 3.1 主流程：`runOnOperation`（L629-L663）
 
 ```cpp
 void PlanVectorBlockPass::runOnOperation() {
@@ -54,6 +54,10 @@ void PlanVectorBlockPass::runOnOperation() {
 
   auto result =
       moduleOp.walk<WalkOrder::PreOrder>([&](Block *block) -> WalkResult {
+        // 打包 scope 单元是原子整体，内部 op 不参与 VECTOR 分块
+        if (isa_and_nonnull<scope::ScopeOp>(block->getParentOp())) {
+          return WalkResult::skip();
+        }
         if (bm.shouldInheritFromParent(block, CoreType::VECTOR_ONLY)) {
           // 纯 VECTOR scf 父 op 的子 block 继承父 id
           if (llvm::failed(bm.inheritFromParent(block))) { ... }
@@ -71,9 +75,10 @@ void PlanVectorBlockPass::runOnOperation() {
 ```
 
 - 与 PlanCubeBlock 镜像结构：继承分支（纯 VECTOR scf）→ 否则 `planVectorBlockId`。
+- **新增 `scope::ScopeOp` 剪枝**：与 PlanCubeBlock 一致——打包 scope 单元是原子整体，内部 op 不打 block id，`WalkResult::skip()` 整棵子树跳过。
 - `bm` 构造时扫描到 CUBE 块已有的 id（Phase 1 发的），因此 `getBlockIdByOp` 能区分"CUBE op / 未分配 op"，这是切割算法的关键输入。
 
-### 3.2 可融合判定：`isFusableOp`（L55-L68）
+### 3.2 可融合判定：`isFusableOp`（L60-L73）
 
 ```cpp
 static bool isFusableOp(Operation *op) {
@@ -121,7 +126,7 @@ passAndCollectCandidates(Operation *nowOp, DenseMap<Operation *, int> &indegree,
 - **绕过不可融合 op**：当用户是不可融合 op（CUBE 块成员），不能简单跳过——需要把"该 op 所在块的所有成员"都处理一遍（`getOpsInSameBlock`），因为 CUBE 块是整体调度的。`byPassNonFusable`（L110-L128）是它的顶层入口：扫描所有"整块就绪但不可融合"的 op，递归绕过。
 - `findCandidates`（L156-L173）：候选空时先尝试 bypass，再把所有"入度 0 + 可融合 + 未访问"的 op 加入候选。
 
-### 3.4 融合主循环：`planVectorBlockId`（L537-L609）
+### 3.4 融合主循环：`planVectorBlockId`（L541-L613）
 
 ```cpp
 llvm::LogicalResult
@@ -169,7 +174,7 @@ planVectorBlockId(Block *block, const MemoryDependenceGraph &memGraph,
 - `updateCandidates`（L130-L154）：融合 `nextFused` 后，从候选移除它；遍历其同 block 用户，减入度，新入度 0 且可融合者入队。
 - **一组融合完 → 先切后发 id**：融合过程中可能把不该在一起的点混进组（比如与 CUBE 边界纠缠的点），所以融合完先 `refineFuseGroup` + `reverseRefineFuseGroup` 双向切割，把组净化后再分配 id。
 
-### 3.5 正向切割：`refineFuseGroup`（L407-L445）
+### 3.5 正向切割：`refineFuseGroup`（L410-L448）
 
 ```cpp
 void refineFuseGroup(Block *block, SmallVector<Operation *> &nowFuseGroup,
@@ -194,13 +199,13 @@ void refineFuseGroup(Block *block, SmallVector<Operation *> &nowFuseGroup,
 
 - `findOpsAdjacentToCube`（L175-L225）：扫组内 op 的用户，找"不可融合且未访问"的用户（即 CUBE 块成员），取**最小 block id** 的 CUBE 块（越小的 block id 表示在 IR 中越靠前的 matmul，优先对齐前面的 CUBE）；再回扫，把"用户属于该最小 CUBE 块"的组内 op 收集为 toProcess。
 - `collectKeepOpsToCube`（L227-L265）：toProcess 里每个 op，沿 `forEachSource<AcrossIterArg>` 收集其上游（含跨迭代参数），闭包内所有"组内" op 保留；特殊处理 `annotation.mark`：其 src 定义 op 在 keepOps 中时 mark 也保留（mark 必须跟班）。
-- `extractWholeFuseGroup`（L320-L364）：**兜底规则**。无 CUBE 邻接时：
+- `extractWholeFuseGroup`（L326-L367）：**兜底规则**。无 CUBE 邻接时：
   - 组内无 tensor op → 全部保留（纯标量/索引组，无切割必要）；
-  - 有 tensor 且 block 是 scf.for/while 体 → 若 op 的 loop-carried 依赖定义 op 属于**别的未分配块**（`bm.getBlockIdByOp(defOp) == -1` 且不在本组），说明该 op 依赖跨循环携带值，切掉它及其用户闭包（`collectAllUsersInFuseGroup`）；
+  - 有 tensor 且 block 的 terminator 是 `scf.yield`（main-dev 放宽：不再限定 `block->getParentOp()` 必须是 scf.for/while，任何以 yield 结尾的块都适用）→ 若 op 的 loop-carried 依赖定义 op 属于**别的未分配块**（`bm.getBlockIdByOp(defOp) == -1` 且不在本组），说明该 op 依赖跨循环携带值，切掉它及其用户闭包（`collectAllUsersInFuseGroup`）；
   - 切完若剩余非 tensor → 返回空（整组切掉）。
 - `evictAndRestoreState`（L366-L405）：状态回滚——把被切 op 从组中移除、恢复其用户的入度（`indegree[user]++`）、重置 visited，候选池重建（旧候选 + 被切 op 中入度为 0 者）。**关键**：被切 op 可以再次作为候选被后续组融合。
 
-### 3.6 反向切割：`reverseRefineFuseGroup`（L511-L534）
+### 3.6 反向切割：`reverseRefineFuseGroup`（L514-L537）
 
 ```cpp
 void reverseRefineFuseGroup(Block *block, SmallVector<Operation *> &nowFuseGroup,
@@ -227,6 +232,7 @@ void reverseRefineFuseGroup(Block *block, SmallVector<Operation *> &nowFuseGroup
 ```
 PlanVectorBlockPass
 └─ walk 每个 Block（PreOrder）
+   ├─ scope::ScopeOp 父 op → skip（打包单元原子，内部不打 block id）
    ├─ 继承分支：纯 VECTOR scf 父 op → 子 block inheritFromParent
    └─ planVectorBlockId
       ├─ initializeIndegreeForBlock（入度只计跨块依赖）
@@ -236,7 +242,7 @@ PlanVectorBlockPass
       │  ├─ 队列空 → 一组完成：
       │  │   ├─ refineFuseGroup（正向切割）
       │  │   │   ├─ findOpsAdjacentToCube：邻接最小 id CUBE 块 → toProcess
-      │  │   │   ├─ 兜底 extractWholeFuseGroup（无 CUBE 邻接时）
+      │  │   │   ├─ 兜底 extractWholeFuseGroup（无 CUBE 邻接时；scf.yield terminator 块）
       │  │   │   ├─ collectKeepOpsToCube（toProcess 上游闭包 + mark 跟班）
       │  │   │   └─ evictAndRestoreState（切掉非 keep，恢复入度/visited/候选）
       │  │   ├─ reverseRefineFuseGroup（反向切割，逻辑对称）
@@ -264,7 +270,7 @@ PlanVectorBlockPass
    被切出的 op 必须回到"未融合"状态：恢复其用户的入度（因为之前融合时减过），重置 visited，让它可以重新进入候选池、被下一组融合。如果不恢复，被切 op 就永远丢失了（既不在本组也不在候选），VECTOR 覆盖就不完整。
 
 5. **`extractWholeFuseGroup` 的兜底规则在解决什么问题？**
-   当组内没有 CUBE 邻接 op 时，正向切割没有依据。兜底检查 loop-carried 依赖：若组内 op 依赖了"属于其他未分配块的循环携带值"（`getLoopCarriedDefOp` 返回的 def 既不在本组也未分配 id），这个 op 的依赖跨了循环边界，必须切掉。这保证 VECTOR 块不会吞下跨循环依赖的 op。
+   当组内没有 CUBE 邻接 op 时，正向切割没有依据。兜底检查 loop-carried 依赖：若组内 op 依赖了"属于其他未分配块的循环携带值"（`getLoopCarriedDefOp` 返回的 def 既不在本组也未分配 id），这个 op 的依赖跨了循环边界，必须切掉。这保证 VECTOR 块不会吞下跨循环依赖的 op。main-dev 把触发条件从"仅 scf.for/while 体"放宽为"terminator 是 scf.yield 的任意块"，覆盖更多以 yield 收尾的容器（如自定义 region 块），避免这些块里的跨循环依赖被漏切。
 
 6. **"候选空时绕过 CUBE 块"（byPassNonFusable）与 CUBE 分块的"绕行非 CUBE op"是同一个思路吗？**
    是同一思路的镜像。CUBE 分块时，CUBE 等非 CUBE 上游 → 绕过非 CUBE；VECTOR 分块时，VECTOR 等 CUBE 上游 → 绕过 CUBE（且按 CUBE 块整体绕过，因为 CUBE 块是整块调度的）。两处都是为了打破"等待链"上的死锁。

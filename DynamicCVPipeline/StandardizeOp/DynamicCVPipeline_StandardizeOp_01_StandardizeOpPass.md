@@ -2,8 +2,10 @@
 
 > 源码文件：
 > - 主 Pass：[`third_party/ascend/lib/DynamicCVPipeline/StandardizeOp.cpp`](../../../third_party/ascend/lib/DynamicCVPipeline/StandardizeOp.cpp)
-> - 子 Pass：[`third_party/ascend/lib/DynamicCVPipeline/StandardizeOp/PatternMatchRewrites.cpp`](../../../third_party/ascend/lib/DynamicCVPipeline/StandardizeOp/PatternMatchRewrites.cpp)
+> - 子 Pass：[`third_party/ascend/lib/DynamicCVPipeline/StandardizeOp/PatternMatchRewrites.cpp`](../../../third_party/ascend/lib/DynamicCVPipeline/StandardizeOp/PatternMatchRewrites.cpp)、[`StandardizeOp/SplitMatmul.cpp`](../../../third_party/ascend/lib/DynamicCVPipeline/StandardizeOp/SplitMatmul.cpp)、[`StandardizeOp/PackMemref.cpp`](../../../third_party/ascend/lib/DynamicCVPipeline/StandardizeOp/PackMemref.cpp)
 > - Pattern：[`StandardizeOp/FoldExpandExtCollapse.cpp`](../../../third_party/ascend/lib/DynamicCVPipeline/StandardizeOp/FoldExpandExtCollapse.cpp)、[`StandardizeOp/SplitMatmulPattern.cpp`](../../../third_party/ascend/lib/DynamicCVPipeline/StandardizeOp/SplitMatmulPattern.cpp)
+>
+> 子专题：[`StandardizeOp/SplitMatmulPass（02）`](./DynamicCVPipeline_StandardizeOp_02_SplitMatmulPass.md)、[`StandardizeOp/PackMemrefPass（03）`](./DynamicCVPipeline_StandardizeOp_03_PackMemrefPass.md)
 >
 > 流水线位置：`AddDynamicCVPipelinePass::addPasses` 中 **第 2 个 pass**（`PreCheckAvailable` 之后、`PlanComputeBlock` 之前）
 
@@ -11,11 +13,15 @@
 
 ## 一、这个 Pass 在做什么
 
-在真正做 CV 拆分之前，把 IR 中 `linalg.matmul` 的形态**标准化**，使其成为"可在 CUBE 上独立计算 + 可在 VECTOR 上补齐累加"的形态：
+在真正做 CV 拆分之前，把 IR 中 `linalg.matmul` 的形态**标准化**，使其成为"可在 CUBE 上独立计算 + 可在 VECTOR 上补齐累加"的形态。由 **3 个子 Pass 顺序执行**：
 
-1. **Matmul 拆分（SplitMatmulPattern，核心）**：`a * b + c` 原本写成一个带累加器（bias）的 matmul；拆成 `(a * b) + c` 两步——matmul 只算乘积（累加器用全零张量），加法单独放一个 `arith.addf/addi` op。这样 matmul 的累加器 `L0C` 完全由 CUBE 自己维护，不需要从 VECTOR 侧传入，后续拆分才能干净地把 matmul 划给 CUBE、把加法划给 VECTOR。
-2. **Shape 归一化（FoldExpandExtCollapse）**：把 `collapse(ext(expand(x)))` 这种"整形 + 位宽扩展"的组合折叠成直接的 `ext(x)`，减少后续分析要穿越的中间 op。
-3. **适用性探测**：拆分过程中如果发现"matmul 可能不会执行"（例如外层 for 的 upper ≤ lower、if 条件非真），给模块打上 `ERRCODE_IGNORED` fallback——kernel 不适合做动态 CV 流水线，回退标准编译。
+1. **PatternMatchRewrite（基础拆分 + shape 归一化）**：
+   - `SplitMatmulPattern`（核心）：`a * b + c` 原本写成一个带累加器（bias）的 matmul；拆成 `(a * b) + c` 两步——matmul 只算乘积（累加器用全零张量），加法单独放一个 `arith.addf/addi` op。这样 matmul 的累加器 `L0C` 完全由 CUBE 自己维护，后续拆分才能干净地把 matmul 划给 CUBE、把加法划给 VECTOR；
+   - `FoldExpandExtCollapse`：把 `collapse(ext(expand(x)))` 折叠成直接的 `ext(x)`，减少中间 shape op。
+2. **SplitMatmul（L0C 复用链拆分，独立 Pass）**：基于 `ControlFlowGraph` 做值流图 + 强连通分量（SCC）分析，识别"L0C 累加器复用链"（cascade matmul 链），对需要拆分的链做**链级拆分**，并在"可能不执行（may-not-execute）"的链上插入跨核 SSBuffer 计数器 + `scf.if` 的 **MNE guard**（防止链完全被跳过时输出未定义值）。
+3. **PackMemref（custom op 打包）**：把 `hivm.hir.custom` 与其本地 buffer 一起打包进一个 `scope::ScopeOp`，并打上分析出的 `core_type`，为后续 `OpClassifier` 的核型分类与 scope 拆分提供干净的单元边界。
+
+**适用性探测的变化（相对旧版本）**：`findMayNotExec` 现在**只打日志、不再设置 `ERRCODE_IGNORED` fallback**——"可能不执行"的 matmul 不再让整个 kernel 回退，而是交给 `SplitMatmulPass` 的 MNE guard 在 IR 层面兜底正确性。
 
 **为什么放在第 2 步**：后续所有 Pass（PlanComputeBlock 分块、SplitDataflow 拆分、传输插入）都假设 matmul 已经处于"乘积 + 加法"的干净形态；先标准化能避免每个下游 Pass 重复处理带累加器的 matmul。
 
@@ -38,41 +44,55 @@
 | `kMatmulAtLeastOnceHint` | `"matmul_at_least_once"` 注解：证明 matmul 至少执行一次，可关闭 mayNotExec 保护 |
 | `needSplitAllFuncNme` | 硬编码的函数名黑名单（当前为空字符串表），命中则无条件拆分所有 matmul |
 | `top-down` greedy | `GreedyRewriteConfig().setUseTopDownTraversal()`，跨 for 块的 matmul 依赖要求自上而下匹配 |
+| `ControlFlowGraph` | 新增 Common 工具（452 行）：按"累计器初值"边构建 C 值流图，支持 SCC 强连通分量分析 |
+| `L0CReuseUnit` | L0C 复用单元：一个 SCC 分量内的 matmul 集合（可能多个 matmul 在环内），含输入/输出/entryOp |
+| `L0CReuseLink` | L0C 复用链：沿单 use 边把 unit 链成一串（producer→consumer），链首输入、链尾输出 |
+| `SCC` | 强连通分量：值流图里互为可达的 matmul 闭包，是链式拆分的基本单位 |
+| `MNE guard` | may-not-execute 保护：每个 matmul 一个 SSBuffer 计数器，`scf.if` 判"全没执行则输出零" |
+| `kMNEStore0` / `kCoupledMatmulAndStore` | MNE 计数器的清零 store 标记 / matmul 与 `store 1` 的成对耦合 id 标记 |
+| `PackMemref` | 把 `hivm.hir.custom` + 本地 buffer 打包进 `scope::ScopeOp`，打 `kCoreType`（UNDETERMINED 时留空给 OpClassifier） |
 
 ---
 
 ## 三、逐行讲解
 
-### 3.1 主 Pass：`StandardizeOp.cpp`（L45-L83）
+### 3.1 主 Pass：`StandardizeOp.cpp`（L46-L86）
 
 ```cpp
+void StandardizeOpPass::getDependentDialects(DialectRegistry &registry) const {
+  createPatternMatchRewritePass()->getDependentDialects(registry);
+  createSplitMatmulPass()->getDependentDialects(registry);
+}
+
 void StandardizeOpPass::runOnOperation() {
   auto op = getOperation();
   if (CVPipeline::hasFallbackAttr(op)) { return; }         // fallback 兜底
 
   OpPassManager pm(op.getOperationName());
-  pm.addPass(createPatternMatchRewritePass());             // 唯一子 Pass
-  if (llvm::failed(runPipeline(pm, op))) {                 // 子 pipeline 失败
+  pm.addPass(createPatternMatchRewritePass());            // 子 Pass 1：基础拆分 + shape 归一化
+  pm.addPass(createSplitMatmulPass());                    // 子 Pass 2：L0C 复用链拆分
+  pm.addPass(createPackMemrefPass());                     // 子 Pass 3：custom op 打包进 scope
+  if (llvm::failed(runPipeline(pm, op))) {                // 子 pipeline 失败
     CVPipeline::setFallbackAttr(op, CVPipeline::ERRCODE_FAILED);
     return;
   }
 
-  // 拆分后检查：是否存在"可能不执行"的 matmul
+  // 拆分后检查：是否存在"可能不执行"的 matmul（只打日志，不再回退）
   bool findMayNotExec = false;
   op->walk([&](linalg::MatmulOp matmulOp) {
     if (matmulOp->hasAttr(CVPipeline::kMayNotExec)) { findMayNotExec = true; }
   });
   if (findMayNotExec) {
-    CVPipeline::setFallbackAttr(op, CVPipeline::ERRCODE_IGNORED);  // 回退标准编译
-    return;
+    LOG_DEBUG("Matmul may not execute!");                 // 不再 setFallbackAttr
   }
 }
 ```
 
-- 主 Pass 是一个**编排壳**：真正的变换在子 Pass `PatternMatchRewritePass` 里。
-- 子 pipeline 失败（rewrite 不收敛）→ `ERRCODE_FAILED`；
-- 拆分后若仍有 `kMayNotExec` matmul → `ERRCODE_IGNORED`。区别在于：`FAILED` 是"我们出错了"，`IGNORED` 是"这个 kernel 本就不适合 CV 流水线"，两者都会让 `AddDynamicCVPipeline` 走回退，但日志语义不同。
-- 注册（L76-L83）：`createStandardizeOpPass()` + `registerStandardizeOpPasses()`（同时注册子 Pass `createPatternMatchRewritePass`）。
+- 主 Pass 是一个**编排壳**：真正的变换在 3 个子 Pass 里。
+- 子 pipeline 失败（rewrite 不收敛 / 拆分失败）→ `ERRCODE_FAILED`；
+- **关键变化**：拆分后若仍有 `kMayNotExec` matmul，**只打日志、不再设置 `ERRCODE_IGNORED` 回退**——"可能不执行"交给 `SplitMatmulPass` 的 MNE guard 在 IR 层面兜底（见 02 子专题）。
+- `getDependentDialects` 显式声明子 Pass 需要的 dialect（linalg/arith/tensor 等），保证翻译单元被正确加载。
+- 注册（L89-L96）：`createStandardizeOpPass()` + `registerStandardizeOpPasses()`（同时注册 `PatternMatchRewritePass`、`PackMemrefPass`、`SplitMatmulPass` 三个子 Pass）。
 
 ### 3.2 子 Pass：`PatternMatchRewritePass`（PatternMatchRewrites.cpp L44-L78）
 
@@ -279,14 +299,14 @@ std::optional<Operation *> traceChainUser(Value value, bool needSingle,
 5. `shouldSplit` → `splitMatmul`；
 6. 否则若 `mayNotExec`：
    - `supported` → `handleMayNotExecSelect`（插入 select 保护）；
-   - 否则 → matmul 打 `kMayNotExec`（触发主 Pass 的 `ERRCODE_IGNORED` 回退）。
+   - 否则 → matmul 打 `kMayNotExec`（供后续 `SplitMatmulPass` 识别，用 MNE guard 兜底，不再整体回退）。
 
 ---
 
 ## 四、算法流程总结
 
 ```
-StandardizeOpPass
+StandardizeOpPass（编排壳，3 个子 Pass）
 ├─ PatternMatchRewritePass（top-down greedy）
 │   ├─ SplitMatmulPattern：为每个 matmul 决策 + 拆分
 │   │   决策链：verifyMatmul → searchInArgsChain(外推 for/if)
@@ -294,10 +314,19 @@ StandardizeOpPass
 │   │   变换：matmul(a,b,bias) → add(new_matmul(a,b,zero), bias)
 │   │         mayNotExec → 插入 cmp + select 保护 / 打 kMayNotExec
 │   └─ FoldExpandExtCollapse：collapse(ext(expand(x))) → ext(x)
-└─ walk 检查：存在 kMayNotExec matmul → ERRCODE_IGNORED 回退
+├─ SplitMatmulPass（L0C 复用链拆分，见 02 子专题）
+│   │   入口：无 kMayNotExec matmul → 直接 return
+│   │   Stage1: ControlFlowGraph + collectL0CReuseUnits(SCC)
+│   │   Stage2: linkReuseL0COps（链成 L0C reuse 链）
+│   │   Stage3: analyzeSplitAndMNE（决策 + may-not-execute）
+│   │   Stage4: splitMatmulChains（链首清零 + 链尾补 add）
+│   │   Stage5: insertMNEGuardUB（SSBuffer 计数器 + if 防未定义）
+│   │   Stage6: setAttrForMatmulChain + 清理 at_least_once 注解
+└─ PackMemrefPass（custom op 打包，见 03 子专题）
+    └─ packAllCustomOpUnits → packCustomOpUnit → 打 kCoreType
 ```
 
-复杂度：`applyPatternsGreedily` 迭代至 fixpoint；每个 matmul 的决策含 use-def 链追溯，最坏 O(use 链长)；嵌套 for 的 cascade 场景会逐层外推。
+复杂度：`applyPatternsGreedily` 迭代至 fixpoint；每个 matmul 的决策含 use-def 链追溯，最坏 O(use 链长)；SplitMatmulPass 的 SCC 分析 O(V+E)；MNE guard 每个可能不执行的 matmul 一个计数器。
 
 ---
 
@@ -310,7 +339,7 @@ StandardizeOpPass
    加零无意义。若 bias 是零填充，`a*b+0 == a*b`，拆分只会增加一个多余的加法 op；直接保留原 matmul 更优。同理广播且小的 bias（≤4096B）走 cache table 也无需拆。
 
 3. **`mayNotExec` 是什么？怎么处理？**
-   外层 for 的 `upper ≤ lower` 或 if 条件可能为假时，matmul 可能不执行，此时拆分后的加法会引入"未定义初值"问题。处理分三档：支持场景（matmul 直接在可能不执行的 for 下）插入 `cmp(ub>lb) ? matmul结果 : 0` 的 select 保护（打 `kForMayNotExec`）；有 `kMatmulAtLeastOnceHint` 证明至少执行一次则关掉保护；其余场景 matmul 打 `kMayNotExec`，主 Pass 发现后整体回退 `ERRCODE_IGNORED`——宁可不用 CV 流水线，也不生成错误语义。
+   外层 for 的 `upper ≤ lower` 或 if 条件可能为假时，matmul 可能不执行，此时拆分后的加法会引入"未定义初值"问题。处理分三档：支持场景（matmul 直接在可能不执行的 for 下）插入 `cmp(ub>lb) ? matmul结果 : 0` 的 select 保护（打 `kForMayNotExec`）；有 `kMatmulAtLeastOnceHint` 证明至少执行一次则关掉保护；其余场景 matmul 打 `kMayNotExec`，交给后续 `SplitMatmulPass` 用 MNE guard（SSBuffer 计数器 + `scf.if` 判"全没执行则输出零"）在 IR 层面兜底——相比旧版"整体回退 `ERRCODE_IGNORED`"，新设计不再牺牲整条流水线，只对可能不执行的链做局部保护。
 
 4. **L0C→L0C / L0C→L1 跨 block 为什么必须拆？**
    NPU 硬件上 matmul 结果在 L0C，若被另一 block 的 matmul 当 bias（L0C→L0C）用，NPUIR 后端插入 fixpipe 会报错；若当 A/B 输入（L0C→L1）用，需要落地全局内存再搬回。这两种跨 block 数据流都必须通过拆分 + 后续 SplitDataflow 插入显式传输来解决。同一 block 内（同一 for 体内）的 cascade 是允许的，因此判断都要求"跨 block"。
@@ -326,3 +355,12 @@ StandardizeOpPass
 
 8. **主 Pass 为什么是编排壳？**
    标准 MLIR 实践：一个逻辑阶段由"小 Pass 组合"实现，便于单独调试、复用、控制 pipeline 粒度。`StandardizeOpPass` 只负责创建子 pipeline 并汇总结果（失败码/适用性探测）。
+
+9. **为什么"mayNotExec 不再整体回退"，而是引入 MNE guard？**
+   旧版一发现"可能不执行的 matmul"就 `ERRCODE_IGNORED` 整体放弃 CV 流水线，对大量含条件 for/if 的 kernel 是"过度回退"——这些 kernel 本来只需对少数链做保护。新设计把正确性兜底下沉到 IR 层：`SplitMatmulPass` 给每个可能不执行的 matmul 分配一个 SSBuffer 计数器（执行后 `store 1`），链末尾用 `scf.if` 判断"所有 matmul 都没执行（计数器全 0）则输出零张量"，既保证语义正确，又保留了 CV 流水线优化。
+
+10. **`SplitMatmulPass` 与 `SplitMatmulPattern` 的分工区别？**
+    老的 `SplitMatmulPattern` 是 greedy pattern，逐 matmul 做 use-def 链决策，处理基础 `a*b+c` 拆分；新的 `SplitMatmulPass` 是基于 `ControlFlowGraph` 的**整链分析**，先做 SCC 找 L0C 复用环、再链成线性 producer→consumer 链、最后链级拆分 + MNE guard。两者互补：pattern 管"单点拆分"，Pass 管"cascade 链的整体拆分与 may-not-execute 保护"。
+
+11. **`PackMemrefPass` 为什么要提前在 StandardizeOp 做 custom op 打包？**
+    `hivm.hir.custom` 与其本地 buffer 通过 `bufferization.to_tensor` 链关联，若不先打包进 `scope::ScopeOp`，后续 `OpClassifier` 看到的是一串零散的 buffer 链，难以正确归类核型。提前打包成"一个 op + 若干 buffer"的 scope 单元，并打上分析所得 `core_type`（但 UNDETERMINED 时故意留空，因为 `OpClassifier` 会把任何显式 `core_type` 当权威、不再重新着色），让后续分类与 scope 拆分有干净的边界。

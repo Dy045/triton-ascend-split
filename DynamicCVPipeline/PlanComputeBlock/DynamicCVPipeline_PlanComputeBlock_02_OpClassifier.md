@@ -1,6 +1,6 @@
 # DynamicCVPipeline 子 Pass 逐行讲解：OpClassifierPass
 
-> 源码文件：[`third_party/ascend/lib/DynamicCVPipeline/PlanComputeBlock/OpClassifier.cpp`](../../../third_party/ascend/lib/DynamicCVPipeline/PlanComputeBlock/OpClassifier.cpp)（1926 行）
+> 源码文件：[`third_party/ascend/lib/DynamicCVPipeline/PlanComputeBlock/OpClassifier.cpp`](../../../third_party/ascend/lib/DynamicCVPipeline/PlanComputeBlock/OpClassifier.cpp)（2163 行）
 >
 > 头文件：[`third_party/ascend/include/DynamicCVPipeline/PlanComputeBlock/OpClassifier.h`](../../../third_party/ascend/include/DynamicCVPipeline/PlanComputeBlock/OpClassifier.h)
 >
@@ -12,11 +12,13 @@
 
 给模块里**每个 op 打上执行单元标签** `ssbuffer.core_type ∈ {CUBE, VECTOR, CUBE_AND_VECTOR}`，同时给所有同步 op 分配**独立 block id**。这是后续 CUBE/VECTOR 分块的前提。
 
+> **main-dev 新增的前置约束：`preClassifiedOps`（预分类 op 边界）**。前序 Pass（`StandardizeOp` 的 `PackMemrefPass`）会把 `hivm.hir.custom` 与其本地 buffer 打包进 `scope::ScopeOp` 并打上 `kCoreType` 属性。OpClassifier 在初始化时把这些"已带权威分类"的 op 收集进 `preClassifiedOps`，作为**传播边界**：不重着色、不写回、不看 scope 内部 body。这条边界保证前序 Pass 的结论不被本 Pass 的 SSA/内存传播覆盖，而且 `scope` 作为原子单元参与后续分块。
+
 核心逻辑可以归纳为**一个核心策略 + 九个步骤**：
 
-**核心策略**：以 `linalg.matmul` 为锚点（matmul 只能在 CUBE 上跑，所以恒为 CUBE），向四周 pattern 匹配出"必然属于 CUBE"的种子 op，再从种子向上 BFS 传播 CUBE；剩下没被染色的 op 默认 VECTOR；再从 VECTOR 向上传播；对于同时被两边使用的 op（CUBE_AND_VECTOR），克隆一份分别归属。
+**核心策略**：以 `linalg.matmul` 为锚点（matmul 只能在 CUBE 上跑，所以恒为 CUBE），向四周 pattern 匹配出"必然属于 CUBE"的种子 op（含 `kMNEStore0` / `kCoupledMatmulAndStore` 标记的 MNE 计数器 store），再从种子向上 BFS 传播 CUBE；剩下没被染色的 op 默认 VECTOR；再从 VECTOR 向上传播；对于同时被两边使用的 op（CUBE_AND_VECTOR），克隆一份分别归属。全程遇到 `preClassifiedOps` 边界即停止。
 
-九个步骤（`runOnOperation` L1835-L1910）：
+九个步骤（`runOnOperation` L2072-L2147）：
 
 | Step | 函数 | 做什么 |
 |---|---|---|
@@ -50,23 +52,30 @@
 | `hivm::SyncBlockSetOp/WaitOp` | 带 `tcore_type` 属性，按 CUBE/VECTOR 直接标 |
 | `hivm::SyncBlockOp` | 带 `SyncBlockMode`：ALL_CUBE→CUBE、ALL_VECTOR/ALL_SUB_VECTOR→VECTOR、ALL→CUBE_AND_VECTOR |
 | `kExternalSync` | 主 Pass 给同步 op 打的标记（值为 1），下游识别"外部同步点" |
+| `kCoreType` | 常量 `"ssbuffer.core_type"`，全文件统一用它读写属性（替换旧版硬编码字符串） |
+| `scope::ScopeOp` | `PackMemrefPass` 打包出的原子单元：内部 op 一起移动；带 `kCoreType` 属性即权威分类 |
+| `preClassifiedOps` | `DenseSet<Operation*>`：初始化时收集"已带 `kCoreType`"的 op，作为不重着色、不写回、不穿透 body 的传播边界 |
+| `kMNEStore0` | `"ssbuffer.mne_store0"` UnitAttr：MNE guard 计数器的清零 store，`patternMatchCUBE` 直接标 CUBE |
+| `kCoupledMatmulAndStore` | `"ssbuffer.coupled_matmul_and_store"` IntegerAttr：matmul 与"执行后 store 1"的成对 id，两者都标 CUBE 并入种子 |
+| `isVectorProducerOp` | 判断 def 是否为"无 region 的纯 VECTOR 计算 op"，用于跳 iter_arg init 的 VECTOR 泄漏 |
+| `getAliasSource`/`getViewSource` | 本地辅助函数：沿 `ViewLikeOpInterface`/`ToTensorOp` 溯源到最终 buffer（判 store 是否落到 GM func 参数） |
 
 ---
 
 ## 三、逐行讲解
 
-### 3.1 主流程：`runOnOperation`（L1835-L1910）
+### 3.1 主流程：`runOnOperation`（L2072-L2147）
 
 ```cpp
 void OpClassifierPass::runOnOperation() {
   ModuleOp module = getOperation();
   if (CVPipeline::hasFallbackAttr(module)) { return; }
 
-  aliasAnalysis = std::make_shared<AliasAnalysis>(module);   // L1848
+  aliasAnalysis = std::make_shared<AliasAnalysis>(module);   // L2085
   memDepGraph = std::make_shared<CVPipeline::MemoryDependenceGraph>(
-      module, *aliasAnalysis);                                // L1849
+      module, *aliasAnalysis);                                // L2086
 
-  initializePass(module);                                     // L1853
+  initializePass(module);                                     // L2090
 
   if (failed(markSynchronizationOp())) {                      // Step 1
     CVPipeline::setFallbackAttr(module, CVPipeline::ERRCODE_FAILED);
@@ -86,25 +95,43 @@ void OpClassifierPass::runOnOperation() {
 - 每一步失败都打 `ERRCODE_FAILED` fallback——分类是全局决策，一步出错就无法产出可信的 core_type，宁可直接回退标准编译。
 - `AliasAnalysis` + `MemoryDependenceGraph` 只在这里构建一次，作为成员传给所有步骤（`getUpstreamOpsWithMemoryDeps` 需要内存边）。
 
-### 3.2 初始化与工具（L139-L162, L118-L136, L165-L170, L172-L194）
+### 3.2 初始化与工具（L144-L179, L181-L190, L192-L212）
 
 ```cpp
-void OpClassifierPass::initializePass(ModuleOp module) {     // L139-L162
+void OpClassifierPass::initializePass(ModuleOp module) {     // L144-L179
   opCoreTypes.clear(); allOps.clear(); cubeSeeds.clear(); ... // 重置所有容器
-  module.walk([&](Operation *op) {
-    if (isa<ModuleOp, func::FuncOp, func::ReturnOp>(op)) return;
-    allOps.push_back(op);                                     // 收集全部 op
+  preClassifiedOps.clear();                                   // 预分类边界也重置
+
+  // 用 PreOrder walk + skip() 把 scope 当原子单元收集（不进 body）
+  module.walk<WalkOrder::PreOrder>([&](Operation *op) -> WalkResult {
+    if (isa<ModuleOp, func::FuncOp, func::ReturnOp>(op))
+      return WalkResult::advance();
+    if (isa<scope::ScopeOp>(op)) {          // 打包 unit：只记录 scope 本身
+      allOps.push_back(op);
+      return WalkResult::skip();            // PreOrder 下 skip 剪掉整棵 body 子树
+    }
+    allOps.push_back(op);
+    return WalkResult::advance();
   });
-  for (Operation *op : allOps) opCoreTypes[op] = OP_UNDETERMINED;
+
+  for (Operation *op : allOps) {
+    opCoreTypes[op] = OP_UNDETERMINED;
+    if (auto ctAttr = op->getAttrOfType<StringAttr>(kCoreType)) {
+      opCoreTypes[op] = parseCoreTypeFromString(ctAttr.getValue().str());
+      preClassifiedOps.insert(op);          // 前序已定类 → 权威，不再重着色
+    }
+  }
 }
 ```
 
 - `allOps` 是**静态快照**：在 walk 时收集。之后即使分裂产生新 op（Step 7），也会被 `push_back` 到 `allOps`，保证 stamp 阶段能覆盖克隆体。
-- `markCube(op)`（L165-L170）：`opCoreTypes[op] |= OP_CUBE_ONLY`——位或语义，如果 op 之前已是 VECTOR，markCube 后变成 CUBE_AND_VECTOR。
-- `isExtractedLoadStoreRelated`（L172-L194）：穿透 `to_tensor → view → alloc` 链，判断是否属于 `hivm::ExtractLoadStoreAttr` 标记的循环（这是显式提取的 load/store 场景，此类 op 保持 VECTOR 不走 CUBE）。
-- `parseCoreTypeFromString`（L118-L136）：解析 `"CUBE,VECTOR"` 多值字符串，按 index 取第 i 个分量（Step 8 的 else 分支处理用）。
+- **`preClassifiedOps` 的收集来源**：初始化时凡是 IR 上已带 `kCoreType`（`ssbuffer.core_type`）的 op，都直接解析入表并放进 `preClassifiedOps`。典型产生者就是 `PackMemrefPass` 打包的 `scope::ScopeOp` 单元。这类 op 的核型是"权威结论"，本 Pass 只读不写。
+- **`scope::ScopeOp` 用 `WalkResult::skip()` 剪枝**：`scope` 内部 ops 不进 `allOps`，所以后面 `markCube`/`setCoreType` 找不到它们（`opCoreTypes.contains` 为 false），自然也不会被重分类；`scope` 整体作为普通 op 参与传播、分块。
+- `markCube(op)`（L181-L190）：`opCoreTypes[op] |= OP_CUBE_ONLY`——位或语义（若已 VECTOR 则变 CUBE_AND_VECTOR）。**新增守卫**：`preClassifiedOps.contains(op)` 或 op 不在 `allOps`（即 scope 内部）时直接 return，不覆盖权威分类。
+- `isExtractedLoadStoreRelated`（L192-L212）：穿透 `to_tensor → view → alloc` 链，判断是否属于 `hivm::ExtractLoadStoreAttr` 标记的循环（显式提取的 load/store 场景，保持 VECTOR 不走 CUBE）。
+- `parseCoreTypeFromString`（约 L130）：解析 `"CUBE,VECTOR"` 多值字符串，按 index 取第 i 个分量（Step 8 的 else 分支处理用）。
 
-### 3.3 Step 1：同步 op 标记——`markSynchronizationOp`（L1753-L1832）
+### 3.3 Step 1：同步 op 标记——`markSynchronizationOp`（L1990-L2070）
 
 ```cpp
 llvm::LogicalResult OpClassifierPass::markSynchronizationOp() {
@@ -139,10 +166,21 @@ llvm::LogicalResult OpClassifierPass::markSynchronizationOp() {
 - **`markOpBlockId` 给每个同步 op 发一个独享 id**——同步 op 是"墙"，必须自己一组，这样任何计算块都不可能与墙同组（否则重排时栅栏会跟着块移动）。
 - `SyncBlockMode::ALL`（全核同步）标 CUBE_AND_VECTOR：Step 7 分裂时，注释说明"克隆保持相同 block id，degrade pass 会按 block id 重新配对"——分裂出的两份同步 op 仍是同一个墙。
 
-### 3.4 Step 2：pattern 匹配找 CUBE 种子——`patternMatchCUBE`（L527-L631）
+### 3.4 Step 2：pattern 匹配找 CUBE 种子——`patternMatchCUBE`（L560-L631）
 
 ```cpp
 int OpClassifierPass::patternMatchCUBE() {
+  // MNE guard 计数器：清零 store（kMNEStore0）→ 标 CUBE
+  for (Operation *op : allOps)
+    if (op->getAttrOfType<UnitAttr>(kMNEStore0)) markCube(op);
+
+  // 配对 store（kCoupledMatmulAndStore，即"执行后 store 1"）→ 标 CUBE 并入种子
+  for (Operation *op : allOps)
+    if (op->getAttrOfType<IntegerAttr>(kCoupledMatmulAndStore)) {
+      markCube(op);
+      cubeSeeds.push_back(op);   // 配对 store 也是传播源
+    }
+
   for (Operation *op : allOps) {
     if (!isa<linalg::MatmulOp>(op)) continue;
 
@@ -161,12 +199,15 @@ int OpClassifierPass::patternMatchCUBE() {
         cur = init->get();
         def = cur.getDefiningOp();
       }
+      if (!def || preClassifiedOps.contains(def)) continue;  // 边界：预分类不碰
       matchToTensorPattern(def);    matchTransposePattern(def);
       matchFillPattern(def);        matchEmptyPattern(def);
       matchBroadcastPattern(def);
     }
 
     // ---- 下游（result 侧）----
+    // 带 kCoupledMatmulAndStore 的 matmul：其 store 已在前面入种子，跳过下游匹配
+    if (op->getAttrOfType<IntegerAttr>(kCoupledMatmulAndStore)) continue;
     for (Value result : op->getResults()) {
       if (!result.hasOneUse()) continue;
       for (Operation *user : result.getUsers()) {
@@ -199,12 +240,20 @@ int OpClassifierPass::patternMatchCUBE() {
 
 **下游三个 pattern**：`matchStorePattern`（hivm.store）、`matchExtractSlicePattern`（extract_slice + 其后的 store/materialize）、`matchMaterializePattern`（bufferization.materialize_in_destination）。作用：保证 matmul 结果写出也走 CUBE，CUBE 侧一次成型，减少跨核搬运。
 
-### 3.5 Step 3：CUBE 向上 BFS——`propagateCubeUpstream`（L798-L840）
+**main-dev 新增的两种 MNE 种子**：`patternMatchCUBE` 开头先扫描 `kMNEStore0`（清零 store）与 `kCoupledMatmulAndStore`（配对 store 1）。前者只 `markCube`，后者额外 `cubeSeeds.push_back`（成为传播源）。它们都是 `SplitMatmulPass` 插入的 MNE guard 计数器 store——清零 store 与"累加器落地"store 必须留在 CUBE 侧，否则拆分出的跨核同步会错位。
+
+### 3.5 Step 3：CUBE 向上 BFS——`propagateCubeUpstream`（L867-L919）
 
 ```cpp
 int OpClassifierPass::propagateCubeUpstream() {
   std::queue<Operation *> cubeQueue;
   for (Operation *seed : cubeSeeds) { cubeVisited.insert(seed); cubeQueue.push(seed); }
+
+  // 预分类里已是 CUBE 的 op 也作为传播源：它自己不重着色，但上游仍要 CUBE 化
+  for (Operation *op : allOps)
+    if (preClassifiedOps.contains(op) && opCoreTypes[op] == OP_CUBE_ONLY) {
+      cubeVisited.insert(op); cubeQueue.push(op);
+    }
 
   while (!cubeQueue.empty()) {
     Operation *cur = cubeQueue.front(); cubeQueue.pop();
@@ -214,6 +263,7 @@ int OpClassifierPass::propagateCubeUpstream() {
 
     for (Operation *def : upstreamOps) {
       if (!def || cubeVisited.count(def) || isa<linalg::MatmulOp>(def)) continue;
+      if (preClassifiedOps.contains(def)) continue;  // 边界：预分类权威，不重着色
       if (shouldSkipCubeUpstream(def)) continue;     // 共享跳过规则
       cubeVisited.insert(def);
       opCoreTypes[def] = OP_CUBE_ONLY;
@@ -233,37 +283,42 @@ int OpClassifierPass::propagateCubeUpstream() {
   4. **ExtractLoadStore 相关**。
 - `markFillOpsAsCube`（L889-L936）：补处理 fill——fill 的 DpsInit（outs）是 CUBE op（非 empty）定义，或 outs 是 CUBE scf op 的 iter_arg → fill 标 CUBE。最后 `handleFillInScfIf`（L940-L979）：fill 在 `scf.if`（无结果、仅做分支）中且 if 内全部 op 都是 CUBE → 整个 scf.if 标 CUBE 并 `propagateCubeUpstreamForOp`（L982-L1012）向上传播。
 
-### 3.6 Step 4：纯 loader 循环渗透——`penetrateCubeIntoForLoops`（L1164-L1184）
+### 3.6 Step 4：纯 loader 循环渗透——`penetrateCubeIntoForLoops`（L1345-L1370）
 
 ```cpp
 llvm::LogicalResult OpClassifierPass::penetrateCubeIntoForLoops() {
   llvm::SmallVector<Operation *> loaderLoops;
   getOperation().walk([&](scf::ForOp forOp) {
+    if (forOp->getParentOfType<scope::ScopeOp>()) return;   // 打包 scope 内部不碰
     if (isCubeLoaderForOp(forOp)) loaderLoops.push_back(forOp);
   });
   getOperation().walk([&](scf::WhileOp whileOp) {
+    if (whileOp->getParentOfType<scope::ScopeOp>()) return;
     if (isCubeLoaderForWhileOp(whileOp)) loaderLoops.push_back(whileOp);
   });
   for (Operation *loop : loaderLoops) {
     Block *body = getLoopBodyBlock(loop);
-    if (body) markLoopBodyAsCube(loop, body, opCoreTypes);  // 整个循环体标 CUBE
+    if (body) markLoopBodyAsCube(loop, body, opCoreTypes, preClassifiedOps);
   }
   return llvm::success();
 }
 ```
 
-- `isCubeLoaderForOp`（L1101-L1125）：**纯 loader 循环**判定：
+- `isCubeLoaderForOp`（L1266-L1297）：**纯 loader 循环**判定：
   1. 无 `hivm::ExtractLoadStoreAttr`；
-  2. 每个结果的所有用户都是 matmul 或 CUBE op（数据只供给 CUBE）；
-  3. 循环体只做数据搬移 + 标量索引计算（`isDisqualifyingLoaderOp` L1080-L1097：linalg 计算、math、tensor 型 arith 都会 disqualify）。
-- `markLoopBodyAsCube`（L1151-L1162）：整个循环体（除 scf 自身）染 CUBE，循环 op 本身也标 CUBE。
+  2. 循环至少有一个结果（新增 `getNumResults() == 0` 直接返回 false——无结果的循环没有数据供给 CUBE，不该被吞并）；
+  3. 每个结果的所有用户都是 matmul 或 CUBE op（数据只供给 CUBE）；
+  4. 循环体只做数据搬移 + 标量索引计算（`isDisqualifyingLoaderOp` L1228-L1262）。
+- **`isDisqualifyingLoaderOp`（L1228-L1262）新增 GM store 判规则**：除原先的 linalg 计算 / math / tensor 型 arith 外，新增通过 `MemoryEffectOpInterface` + `MemoryEffects::Write` 判"是否有 store 写回全局内存"——`getEffectValue` 经 `getViewSource` 溯源到 `func.func` 块参数（即 GM buffer）就 disqualify。原因：纯 loader 循环只能从 GM **读**，一旦有 GM **写**，说明循环里有真实产出，不能再整体吞进 CUBE。
+- `markLoopBodyAsCube`（L1327-L1345）：整个循环体（除 scf 自身）染 CUBE，循环 op 本身也标 CUBE；新增 `preClassifiedOps` 守卫——预设类 op 与 scope 自身不重着色。
 - 动机：triton 里常见的"把 A 矩阵从全局内存搬进循环"的 for，体里只有 `to_tensor/load/copy`。这类循环本质是 CUBE 侧的数据加载，标成 CUBE 后整个循环作为 CUBE 计算块，减少核间交互。
 
-### 3.7 Step 5：剩余默认 VECTOR——`markRemainingAsVector`（L849-L869）
+### 3.7 Step 5：剩余默认 VECTOR——`markRemainingAsVector`（L931-L957）
 
 ```cpp
 int OpClassifierPass::markRemainingAsVector() {
   for (Operation *op : allOps) {
+    if (preClassifiedOps.contains(op)) continue;   // 预设类 op 不重着色
     if (isa<annotation::MarkOp>(op)) {       // mark 跟随其 src 定义 op 的类型
       Value src = markOp.getSrc();
       opCoreTypes[op] = src.getDefiningOp() ? getCoreType(srcDef) : OP_VECTOR_ONLY;
@@ -278,9 +333,10 @@ int OpClassifierPass::markRemainingAsVector() {
 ```
 
 - **默认值语义**：CUBE 是"特权"，需要被证明（种子 + 传播）；VECTOR 是"兜底"，所有未分类的 op 都默认 VECTOR。这保证任何 op 最终都有确定归属。
+- **新增 `preClassifiedOps` 守卫**：前序预分类的 op（如 scope 单元）保持权威类型，即使它没被 CUBE 证明也不降级为 VECTOR。
 - `annotation.mark` 特例：mark op 不产生计算，跟随其 src 定义 op 的类型（后续 PlanCubeBlock 的 `fuseMarkOpToDef` 也是这个逻辑）。
 
-### 3.8 Step 6：VECTOR 向上 BFS——`propagateVectorUpstream`（L1022-L1073）
+### 3.8 Step 6：VECTOR 向上 BFS——`propagateVectorUpstream`（L1119-L1196）
 
 ```cpp
 int OpClassifierPass::propagateVectorUpstream() {
@@ -291,10 +347,25 @@ int OpClassifierPass::propagateVectorUpstream() {
     Operation *cur = vecQueue.front(); vecQueue.pop();
     // 跳过 module/func/return；已是 CUBE 的 memref.copy/alloca 也不动
     ...
+    // 计算 iter_arg init 的"豁免集"：这些 init 的分类由 body 侧消费者决定，
+    // 循环外部消费者的 VECTOR 不能泄漏到它们身上
+    llvm::SmallPtrSet<Operation *, 4> skipIterArgInits;
+    if (auto loop = dyn_cast<LoopLikeOpInterface>(cur)) {
+      for (OpOperand &init : loop.getInitsMutable()) {
+        BlockArgument iterArg = loop.getTiedLoopRegionIterArg(&init);
+        // 例外：yield 值来自纯 VECTOR 计算 op 的 recurrence，其 init 必须保持可 VECTOR 化
+        if (iterArg && isVectorProducerOp(getLoopCarriedDefOp(iterArg, iterArg.getOwner())))
+          continue;
+        if (Operation *defOp = init.get().getDefiningOp())
+          skipIterArgInits.insert(defOp);
+      }
+    }
     for (Operation *def : upstreamOps) {
       if (!def || vecVisited.count(def)) continue;
-      if (isa<linalg::MatmulOp>(def) || isa<scf::SCFDialect>(def->getDialect()))
-        continue;                          // matmul 与 scf 是传播墙
+      if (preClassifiedOps.contains(def) ||
+          isa<linalg::MatmulOp>(def) || isa<scf::SCFDialect>(def->getDialect()))
+        continue;                          // 预设类/matmul/scf 都是传播墙
+      if (skipIterArgInits.count(def)) continue;   // iter_arg init 不泄 VECTOR
       vecVisited.insert(def);
       opCoreTypes[def] |= OP_VECTOR_ONLY;  // 位或：CUBE+VECTOR → CUBE_AND_VECTOR
       vecQueue.push(def);
@@ -305,10 +376,12 @@ int OpClassifierPass::propagateVectorUpstream() {
 ```
 
 - 从所有 VECTOR op 出发向上传播：被 VECTOR 消费的上游数据必须也能在 VECTOR 侧生成。
-- **传播墙**：`linalg.matmul`（只能 CUBE）和 scf 方言（控制流不标 VECTOR）。
+- **传播墙（main-dev 三墙）**：`preClassifiedOps`（预设类权威）、`linalg.matmul`（只能 CUBE）、scf 方言（控制流不标 VECTOR）。
+- **新增 `skipIterArgInits` 逻辑**：当 `cur` 是循环时，其 iter_arg 对应的 init 定义 op 会被豁免——因为这些 init 的归属应由"body 内消费者"决定，而不是被"循环外部的 VECTOR 消费者"反向染色。**唯一例外**是 `isVectorProducerOp` 判定的纯 VECTOR 生产者 recurrence（yield 值来自真正的 VECTOR 计算 op，而 matmul 输入只读它），此时 init 必须保持可 VECTOR 化，Step 7 才能把它分裂并把 VECTOR 克隆绑定到循环。
+- `isVectorProducerOp(def)`（L1720-L1731）：region 容器（`getNumRegions() > 0`）直接排除（它们的 op 级类型不可信），`isTensorArithOrMathOp` 为真、或 `getCoreType == OP_VECTOR_ONLY` 才算纯 VECTOR 生产者。
 - 位或语义：若上游已是 CUBE_ONLY，`|= OP_VECTOR_ONLY` 后变成 CUBE_AND_VECTOR——这就是"共享 op"的发现机制，交给 Step 7 分裂。
 
-### 3.9 Step 7：CUBE_AND_VECTOR 分裂——`handleCubeAndVector`（L1670-L1698）+ `splitOperationForCubeAndVector`（L1565-L1658）
+### 3.9 Step 7：CUBE_AND_VECTOR 分裂——`handleCubeAndVector`（L1900-L1932）+ `splitOperationForCubeAndVector`（L1792-L1889）
 
 这是全文件最精巧的部分。核心问题：**一个 op 同时被 CUBE 用户和 VECTOR 用户使用**（如 `linalg.fill` 既喂 matmul 又喂 `arith.addf`），但两颗核不能共享同一个 op 实例——必须克隆。
 
@@ -371,10 +444,10 @@ void OpClassifierPass::splitOperationForCubeAndVector(
 ```
 
 - **Phase 1 为什么要递归**：假设 `addf ← fill1 ← matmul`，fill1 是 CUBE_AND_VECTOR（被 addf 和 matmul 共用）。分裂 addf 的输入时，需要把 fill1 的克隆也带出来，否则 addf 克隆体仍指向原 fill1（CUBE 版）。深度优先保证"operand 克隆先于自身克隆"。
-- **Phase 4 的重定向规则**：`getForInitCoreType`（L1511-L1542）处理 scf.for/while 作为用户的情况——循环 op 本身没有明确 core_type，要看这个 use 对应哪个迭代变量、该迭代变量的 yield 值定义 op 是什么类型。这是"循环携带的 SSA 值归哪边"的关键判定。
-- `handleCubeAndVector`（L1670-L1698）用 **do-while** 循环反复扫描：分裂一个 op 可能让新的 CUBE_AND_VECTOR 出现（分裂后其 operands 的处理），直到不再有新分裂。
+- **Phase 4 的重定向规则**：`getForInitCoreType`（L1733-L1764）处理 scf.for/while 作为用户的情况——循环 op 本身没有明确 core_type，要看这个 use 对应哪个迭代变量、该迭代变量的 yield 值定义 op 是什么类型。这是"循环携带的 SSA 值归哪边"的关键判定。
+- `handleCubeAndVector`（L1900-L1932）用 **do-while** 循环反复扫描：分裂一个 op 可能让新的 CUBE_AND_VECTOR 出现（分裂后其 operands 的处理），直到不再有新分裂。
 
-### 3.10 Step 8：scf.yield 类型标注——`handleSCFYield`（L1468-L1509）
+### 3.10 Step 8：scf.yield 类型标注——`handleSCFYield`（L1675-L1716）
 
 ```cpp
 int OpClassifierPass::handleSCFYield() {
@@ -392,11 +465,12 @@ int OpClassifierPass::handleSCFYield() {
 ```
 
 - 每个 operand 按"其定义 op 的类型"标注：`OP_CUBE_ONLY → "CUBE"`，其余（含无定义 op 的 iter_arg）→ `"VECTOR"`。
-- **else 分支以 then 分支为参考**（`handleYieldFromElseRegion` L1316-L1359）：else 的 yield 没有自己的类型来源，直接用 then yield 的 `ssbuffer.core_type` 字符串取第 i 个分量；若 operand 定义 op 有克隆（CUBE_AND_VECTOR 分裂过），把 else yield 的 operand 重定向到克隆结果。
-- `processYieldOperation`（L1374-L1453）最后把组合字符串写到 yield op 和父 scf op 上（`ssbuffer.core_type`），父 scf op 的类型取"字符串含 CUBE → CUBE_ONLY，否则 VECTOR_ONLY"。
+- **else 分支以 then 分支为参考**（`handleYieldFromElseRegion` L1369-L1398 附近）：else 的 yield 没有自己的类型来源，直接用 then yield 的 `kCoreType` 字符串取第 i 个分量；若 operand 定义 op 有克隆（CUBE_AND_VECTOR 分裂过），把 else yield 的 operand 重定向到克隆结果。
+- `processYieldOperation`（L1556-L1650）最后把组合字符串写到 yield op 和父 scf op 上（`kCoreType`，替换旧版硬编码 `"ssbuffer.core_type"`），父 scf op 的类型取"字符串含 CUBE → CUBE_ONLY，否则 VECTOR_ONLY"。源码注释明确：yield 及父 scf op 从不会被打包进 scope，因此这里无需 preClassified 守卫。
+- **`shouldStopPropagationForYield`（L1411-L1455）新增 `hivm::CustomOp` 停止点**：BFS 传播到 `hivm.hir.custom` 就停，防止通过 memory dependence 从 SSA tensor 世界穿回 memref 世界、覆盖前序 Pass 已定好的分类（例如一个支撑 matmul 输入的 `memref.alloc` 已被标 CUBE）。
 - 为什么需要这步：scf 结构作为整体会被分块/移动，必须有明确的 core_type 归属。
 
-### 3.11 Step 9：写回 IR——`stampToIR`（L1704-L1748）
+### 3.11 Step 9：写回 IR——`stampToIR`（L1936-L1988）
 
 ```cpp
 int OpClassifierPass::stampToIR() {
@@ -413,7 +487,7 @@ int OpClassifierPass::stampToIR() {
     if (isInsideLinalgBlock) continue;
     if (isa<ModuleOp, func::FuncOp>(op)) continue;
 
-    op->setAttr("ssbuffer.core_type",
+    op->setAttr(kCoreType,
                 StringAttr::get(op->getContext(), coreTypeToString(coreType)));
   }
   return 0;
@@ -421,7 +495,7 @@ int OpClassifierPass::stampToIR() {
 ```
 
 - 只对"有真正归属意义"的 op 写属性：scf 内部大部分 op（如 `scf.for` 的迭代变量使用处）不写；`scf.condition`（while before region 的条件判定）恒 VECTOR——条件计算属于标量/向量逻辑，不是矩阵计算。
-- 至此，IR 上每个 op 都有 `ssbuffer.core_type`，同步 op 有独享 `ssbuffer.block_id`，可以进入 CUBE/VECTOR 分块。
+- 至此，IR 上每个 op 都有 `kCoreType`（`ssbuffer.core_type`），同步 op 有独享 `ssbuffer.block_id`，可以进入 CUBE/VECTOR 分块。
 
 ---
 
@@ -429,24 +503,29 @@ int OpClassifierPass::stampToIR() {
 
 ```
 OpClassifierPass
+├─ Step 0  initializePass：收集 preClassifiedOps（已带 kCoreType 的 scope/custom 单元），
+│          scope 用 skip() 剪枝不进 body
 ├─ Step 1  markSynchronizationOp：同步 op 分类 + 独享 block id + kExternalSync
-├─ Step 2  patternMatchCUBE：matmul 锚点，上游 5 pattern + 下游 3 pattern 收集 CUBE 种子
-│          （loop iter_arg 穿透 LoopLikeOpInterface 找到真 init）
+├─ Step 2  patternMatchCUBE：先扫 kMNEStore0/kCoupledMatmulAndStore（MNE 计数器 store 种子），
+│          再以 matmul 为锚点，上游 5 pattern + 下游 3 pattern 收集 CUBE 种子
+│          （loop iter_arg 穿透 LoopLikeOpInterface 找到真 init；preset 边界跳过）
 ├─ Step 3  propagateCubeUpstream：种子 BFS 向上传播 CUBE（SSA+内存双维）
-│          ├─ 跳过：tensor arith/math、VECTOR-producer 的 extract、linalg 内部、ExtractLoadStore
+│          ├─ preClassifiedOps 的 CUBE 单元也作传播源，但自身不重着色
+│          ├─ 跳过：preClassified、tensor arith/math、VECTOR-producer 的 extract、linalg 内部、ExtractLoadStore
 │          └─ markFillOpsAsCube（fill 的 outs 是 CUBE → CUBE）+ handleFillInScfIf（全 CUBE 的 if → CUBE）
-├─ Step 4  penetrateCubeIntoForLoops：纯 loader 循环整体染 CUBE
-├─ Step 5  markRemainingAsVector：剩余默认 VECTOR（mark 跟随 src 类型）
-├─ Step 6  propagateVectorUpstream：VECTOR 向上 BFS，|VECTOR；matmul/scf 是传播墙
+├─ Step 4  penetrateCubeIntoForLoops：纯 loader 循环整体染 CUBE（scope 内部跳过；GM store 判定 disqualify）
+├─ Step 5  markRemainingAsVector：剩余默认 VECTOR（mark 跟随 src 类型；preClassified 不降级）
+├─ Step 6  propagateVectorUpstream：VECTOR 向上 BFS，|=VECTOR；preClassified/matmul/scf 是传播墙
+│          └─ skipIterArgInits：iter_arg init 不由外部 VECTOR 反向染色（isVectorProducerOp 例外）
 ├─ Step 7  handleCubeAndVector：CUBE_AND_VECTOR 分裂（do-while）
 │          ├─ 递归先分裂上游共享 op
 │          ├─ 克隆 + 重分类（原 CUBE / 克隆 VECTOR）
 │          └─ 重定向 VECTOR 用户（for/while 用户按 getForInitCoreType 判定）
-├─ Step 8  handleSCFYield：yield 与父 scf 打 ssbuffer.core_type（else 参考 then，克隆重定向）
+├─ Step 8  handleSCFYield：yield 与父 scf 打 kCoreType（else 参考 then，克隆重定向；停 at hivm.custom）
 └─ Step 9  stampToIR：写回 IR（跳过 scf 内部 / linalg 内部；scf.condition 恒 VECTOR）
 ```
 
-**分类的"方向性"**：CUBE 先证后传播（种子必须显式匹配），VECTOR 先兜底后传播（剩余即 VECTOR），最后用"克隆分裂"调和两者对共享 op 的争夺。整个顺序保证：每个 op 最终有且仅有一个明确归属（CUBE 或 VECTOR，克隆后不存在 CUBE_AND_VECTOR）。
+**分类的"方向性"**：CUBE 先证后传播（种子必须显式匹配），VECTOR 先兜底后传播（剩余即 VECTOR），最后用"克隆分裂"调和两者对共享 op 的争夺。整个顺序保证：每个 op 最终有且仅有一个明确归属（CUBE 或 VECTOR，克隆后不存在 CUBE_AND_VECTOR）。**main-dev 新增的 `preClassifiedOps` 边界贯穿所有步骤**——前序 Pass 的权威分类（scope/custom 单元）只读不写、不参与双向传播。
 
 ---
 
@@ -475,3 +554,9 @@ OpClassifierPass
 
 8. **memory 依赖（memDepGraph）在这里解决什么问题？**
    纯 SSA 依赖不够：`to_tensor` 的 memref 可能来自一个 `memref.copy`（无 SSA 直连），如果只按 SSA 传播，copy 链不会被 CUBE 化，产生"CUBE 侧读、VECTOR 侧搬"的割裂。`getUpstreamOpsWithMemoryDeps` 对 to_tensor 额外取 `memDefs` 中的 copy 加入上游，把内存搬运也纳入 CUBE 传播。
+
+9. **`preClassifiedOps` 预分类边界为什么必要？**
+   main-dev 里 `StandardizeOp` 前置的 `PackMemrefPass` 已经把 `hivm.hir.custom` + 本地 buffer 打包成 `scope::ScopeOp` 并打上权威 `kCoreType`。如果不设边界，OpClassifier 的 SSA/内存 BFS 会重着色甚至覆盖这些结论（尤其 custom 通过 memory dependence 把 tensor 世界连回 memref 世界）。因此初始化时把它们收集成 `preClassifiedOps`：只作传播源、不重着色、不写回、`scope` 内部不进 `allOps`。这保证"打包单元"作为原子整体参与后续分块，而不是被打散。
+
+10. **为何 `patternMatchCUBE` 单独把 MNE 计数器 store 提前标 CUBE？**
+   `SplitMatmulPass` 插入的 MNE guard 计数器 store（`kMNEStore0` 清零 store、`kCoupledMatmulAndStore` 配对 store 1）必须与 matmul 同侧（CUBE）执行，否则跨核同步会被错位到 VECTOR。它们没有直接的 matmul 邻接关系（不在上游/下游常规 pattern 覆盖范围内），所以要单独扫属性提前标 CUBE 并（配对 store）纳入种子传播；带配对标记的 matmul 则跳过下游 pattern 匹配，避免重复入种子。

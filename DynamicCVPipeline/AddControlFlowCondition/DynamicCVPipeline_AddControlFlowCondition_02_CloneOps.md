@@ -272,9 +272,14 @@ static bool shouldEraseOpForCube(
     const llvm::DenseMap<Operation *, llvm::SmallPtrSet<Operation *, 4>>
         &sameBlockIdExecAfter,
     const llvm::DenseSet<Operation *> &erasedOps) {
-  // Rule 1: SyncBlockWaitOp, SyncBlockSetOp, FixpipeOp -> directly erase
+  // Rule 1: SyncBlockWaitOp, SyncBlockSetOp, FixpipeOp -> directly erase,
+  // including when inter-core multi-buffering has already wrapped them in an
+  // scf.if picking the flag for this iteration's buffer half. Only scf.ifs
+  // that yield nothing qualify: the wrapper around a transfer op yields its
+  // result and is data, not a handshake.
   if (isa<SyncBlockWaitOp>(op) || isa<SyncBlockSetOp>(op) ||
-      isa<hivm::FixpipeOp>(op)) {
+      isa<hivm::FixpipeOp>(op) ||
+      (op->getNumResults() == 0 && isIfOpWithOnlySyncOps(op))) {
     return true;
   }
   ...
@@ -282,6 +287,8 @@ static bool shouldEraseOpForCube(
 ```
 
 **要点**：三条规则递进——类型规则（同步/搬移必删）→ SSA 规则（结果仍被同 block 使用则留）→ 存储依赖规则（无结果时看 memgraph exec-after）。`erasedOps` 集合让"本轮已删除的 op"不再约束当前 op，等价于每次重建。
+
+**main-dev 更新点**：Rule 1 新增第三种必删对象——**无结果、且只含同步 op 的 `scf.if`**（`isIfOpWithOnlySyncOps`）。起因是核间多缓冲（`AddMultiBufferOuterScope`）会把同步 wait/set 按奇偶缓冲包进一个 `scf.if` 来选择本轮 flag。克隆去共享时，这类"纯握手 if"同样需要删（重复克隆会重复握手）。关键限定 `getNumResults()==0`：**有结果的 if 是"数据"（传输 op 的包装，yield 结果，是 SSA 依赖而非握手），不能删**。同时 `validateClonedSyncOpsErased` 从"只看顶层"升级为 `op.walk` 递归（`Look inside as well`），确保被包进 if/region 内部的 sync op 也被校验删除，不再漏过嵌套握手。配套地，`Utils.cpp` 的 `isIfOpWithOnlySyncOps` 开头新增 `if (op->hasAttr(kSplittedIf)) return true;` 捷径——被打上 `kSplittedIf` 标记的分裂 if 本身就是纯控制流骨架（其 then 会在 Step7 `SplittedIfWrapSsbufIf` 中被展开），应直接视为"仅握手"。
 
 ### 3.7 校验：validateBlockIdsConsecutive / validateClonedOpsInVector（L442-L552）
 

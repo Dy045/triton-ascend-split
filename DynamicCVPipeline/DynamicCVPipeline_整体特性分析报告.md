@@ -32,9 +32,10 @@
 ```
 阶段一：规划（能不能做、怎么分块）
   PreCheckAvailable ─ 可行性预检，排除不适合的 kernel
-  StandardizeOp ──── 把累加 matmul 拆成 matmul + add（消除归约共享，便于分块）
+  StandardizeOp ──── 拆累加 matmul（SplitMatmulPass 做 L0C 复用链 + MNE guard），
+                     PackMemrefPass 把 custom+alloc+to_tensor 链打包进 scope
   PlanComputeBlock ─ 按 OpClassifier 把 op 分类成 CUBE/Vector，赋 block_id
-  ComputeBlockOpt ── UB 合并/load 优化/块合并/if 分裂，让块形状利于流水
+  ComputeBlockOpt ── UB 合并/load 优化/块合并/if 分裂（含 ExpLoadPattern、CloneCubeDepInIf）
 
 阶段二：拆分（数据流与缓冲）
   SplitDataflow ──── 打 block_id/flag_id、跨核传输与 sync、SeparateCVScope 拆双核作用域
@@ -42,10 +43,12 @@
   AllocMultiCache ── 核内/核间多缓冲分配，写 ssbuffer.cross_deps / intra_deps 属性
 
 阶段三：控制与收尾（让流水真正转起来）
-  AddControlFlowCondition ─ 6 子 Pass：克隆去共享 → 拆 iter_arg → 建 if → 建依赖 DAG
+  AddControlFlowCondition ─ 7 子 Pass：克隆去共享 → 拆 iter_arg → 建 if → 建依赖 DAG
                             → 扩展循环 + PIPE_S → 构造真实同步条件 → 扩展迭代次数
+                            → splitted_if 包装 ssbuffer.if（归一迭代分派 if）
   SeparateMemoryFromCompute ─ MarkGMLoad（GM 加载多缓冲）+ UBOverflowChecker（UB 防溢出）
-  RemoveSsbufAttr ──────────── 清理全部 ssbuffer.* 中间属性，交付干净 IR
+  RemoveSsbufAttr ──────────── 清理全部 ssbuffer.* 中间属性（含 main-dev 新增的 MNE guard /
+                              coupled store / loop depth/region 等属性），交付干净 IR
 ```
 
 **设计要点——"先分析后变换"**：所有阶段都严格遵循"只读收集候选 → 改写"模式（如 `MarkGMLoadPass` Phase1 收集、Phase2/3 改写），且中间状态全部以**属性（attribute）**在 IR 上显式传递（`block_id`/`main_loop`/`cross_deps`/`intra_deps`/`multi_buffer` 等），每个 Pass 只读自己需要的属性、只写自己的产出——**Pass 间零全局状态，可独立注册、独立失败**。
@@ -117,8 +120,8 @@
   → SplitDataflow（拆双核、建传输与同步骨架）
   → AnalyzeDataFlow（可行性 6 查）
   → AllocMultiCache（分配多缓冲，写依赖属性）
-  → AddControlFlowCondition（6 子 Pass：去共享 → 拆 arg → 建 if → 建 DAG → 扩循环 →
-                              真实条件 → 扩迭代，双核流水正式成型）
+  → AddControlFlowCondition（7 子 Pass：去共享 → 拆 arg → 建 if → 建 DAG → 扩循环 →
+                              真实条件 → 扩迭代 → splitted_if 包装 ssbuffer.if，双核流水正式成型）
   → SeparateMemoryFromCompute（GM 加载多缓冲 + UB 防溢出）
   → RemoveSsbufAttr（清理中间属性）
   → 交付给后端
